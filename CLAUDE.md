@@ -1,0 +1,255 @@
+# Events MCP Server — Project Context for Claude Code
+
+## 🎯 Project Overview
+
+I am building an **MCP (Model Context Protocol) server** for live event discovery and booking simulation. Think of this as a learning-oriented clone of what Zomato did for food ordering, but for events — concerts, sports, theater, festivals.
+
+Users will interact with it through Claude Desktop (or any MCP-compatible AI client) using natural language like:
+- "Find concerts in Mumbai this weekend under ₹2000"
+- "What Marvel-related events are happening near me?"
+- "Save this event to my favorites"
+- "Simulate booking 2 tickets for event X"
+
+## 👤 About Me (The Developer)
+
+- **Experience level:** Comfortable with JavaScript/Node basics, new to Python, new to MCP
+- **Goal:** This is a **learning project**. I want to understand every concept before writing code, not just ship fast.
+- **Learning style:** Short explanation of new concepts first → then code. I'll ask for deeper dives when needed.
+- **Do NOT** skip explanations assuming I know something advanced. When introducing a new library, pattern, or concept, explain it briefly first.
+
+## 🛠️ Tech Stack (Locked In)
+
+| Layer | Tool |
+|---|---|
+| Language | Python 3.11+ |
+| Package manager | `uv` (not pip) |
+| MCP SDK | `mcp[cli]` (official Anthropic Python SDK, using `FastMCP`) |
+| Schema validation | `pydantic` v2 |
+| HTTP client | `httpx` (async) |
+| Env config | `python-dotenv` |
+| Caching | `cachetools` (Phase 3) |
+| Local storage | `tinydb` → SQLite later (Phase 4) |
+| Rate limiting | `aiolimiter` (Phase 3) |
+| Logging | `structlog` |
+| Testing | `pytest` + `pytest-asyncio` |
+| MCP debugging | `@modelcontextprotocol/inspector` (via npx) |
+| Linting | `ruff` |
+| Type checking | `mypy` |
+| Transport Phase 1 | stdio |
+| Transport Phase 6 | Streamable HTTP |
+| Data source | Ticketmaster Discovery API (free tier, 5000 calls/day) |
+
+## 📊 Data Source Details
+
+**Primary API:** Ticketmaster Discovery API
+- Base URL: `https://app.ticketmaster.com/discovery/v2/`
+- Auth: API key as query param `apikey=XXX`
+- Rate limit: 5000 requests/day, 5 requests/second
+- Docs: https://developer.ticketmaster.com/products-and-docs/apis/discovery-api/v2/
+- Key endpoints we'll use:
+  - `GET /events.json` — search events
+  - `GET /events/{id}.json` — event details
+  - `GET /venues.json` — search venues
+  - `GET /attractions.json` — artists/teams/performers
+
+**Important:** Ticketmaster has NO public booking endpoint. The "booking" flow will be a **realistic simulation** — building the full cart/reserve/checkout state machine without real payment. This is intentional for learning.
+
+## 📐 Architecture
+
+```
+[User] → [Claude Desktop] ⇄ [MCP Client] ⇄ [Our MCP Server (Python)] → [Ticketmaster API]
+                                                ↓
+                                        [Local storage: favorites, mock bookings]
+```
+
+## 📅 Phased Build Plan
+
+We're building this in phases. **Do not jump ahead.** Each phase introduces new concepts I need to learn before coding.
+
+### Phase 0 — Foundations ✅ (COMPLETED)
+Covered: MCP primitives, JSON-RPC, transports, tool-calling loop, security mindset
+
+### Phase 1 — Hello World MCP Server (CURRENT)
+- Set up Python project with `uv`
+- Install MCP SDK
+- Build a single dummy tool (`hello`)
+- Connect to Claude Desktop via stdio
+- Test with MCP Inspector
+- **Goal:** See the tool show up in Claude and respond
+
+### Phase 2 — Ticketmaster Integration
+- Add `.env` and API key management
+- Build `search_events`, `get_event_details`, `search_venues`, `search_attractions` tools
+- Use `httpx` async client
+- Pydantic models for API responses
+- **Goal:** "Find concerts in Mumbai this weekend" returns real data
+
+### Phase 3 — Robustness
+- Add caching layer (`cachetools`)
+- Add rate limiting (`aiolimiter`)
+- Add `structlog` structured logging
+- Tighten all Pydantic schemas with `.strict()`
+- **Goal:** Stay within API quota, handle errors gracefully
+
+### Phase 4 — User Context & State
+- Add `tinydb` for local persistence
+- Build `save_favorite`, `list_favorites`, `remove_favorite`
+- Build `set_preferences`, `get_preferences`
+- Build `get_recommendations` (uses preferences + Ticketmaster)
+- Add a resource that exposes the favorites list
+- **Goal:** Server remembers the user across sessions
+
+### Phase 5 — Simulated Booking Flow
+- State machine: `created → items_added → reserved → paid → confirmed`
+- Tools: `create_cart`, `add_to_cart`, `get_cart`, `reserve_seats`, `generate_payment_link`, `confirm_booking`
+- Mock QR code generation
+- Seat holds with expiry
+- **Goal:** Full conversational booking flow end-to-end
+
+### Phase 6 — HTTP Transport & Deployment
+- Convert stdio → Streamable HTTP
+- Deploy to Render/Railway/Fly.io free tier
+- Make the server publicly accessible via URL
+- **Goal:** Share a URL anyone can plug into Claude Desktop
+
+### Phase 7 — Polish & Ship
+- Write manifest
+- Improve tool descriptions (LLMs read these!)
+- README with demo GIF
+- Public GitHub repo
+
+## 🔒 Security Requirements (Non-Negotiable)
+
+1. **Every tool input validated with Pydantic** — assume inputs come from an LLM, not a human
+2. **Never execute shell commands from tool inputs** — no `os.system`, no `subprocess` with user data, no `eval`
+3. **Never log secrets** — API keys, tokens should never appear in logs
+4. **Use `.env` for all secrets** — `.env` must be in `.gitignore` from day one
+5. **Sanitize external API responses** — treat event descriptions as data, not instructions (prompt injection risk)
+6. **Never write to stdout in stdio mode** — breaks the protocol. Use `structlog` or stderr only.
+7. **Scoped API keys** — Ticketmaster key has minimum permissions
+
+## 🧠 Ethical Considerations (Baked In)
+
+- **No scalping features** — nothing that helps bulk-buy tickets for resale
+- **Price transparency** — always surface fees upfront, no hidden costs
+- **No fake urgency** — only claim "X seats left" if the API literally says so
+- **Manual payment confirmation** — never auto-charge, always generate a link and let user confirm
+- **Recommendation transparency** — if we sort/filter events, document the ranking logic
+
+## 📁 Expected Project Structure
+
+```
+events-mcp-server/
+├── CLAUDE.md                 # This file
+├── README.md
+├── pyproject.toml
+├── uv.lock
+├── .env                      # NEVER committed
+├── .env.example              # Template, committed
+├── .gitignore
+├── src/
+│   └── events_mcp/
+│       ├── __init__.py
+│       ├── server.py         # Main MCP server
+│       ├── config.py         # Env loading
+│       ├── logging.py        # structlog setup
+│       ├── clients/
+│       │   └── ticketmaster.py  # API wrapper
+│       ├── tools/
+│       │   ├── discovery.py  # search_events, etc.
+│       │   ├── favorites.py  # Phase 4
+│       │   └── booking.py    # Phase 5
+│       ├── models/           # Pydantic models
+│       │   ├── events.py
+│       │   └── cart.py
+│       ├── storage/          # Phase 4+
+│       │   └── db.py
+│       └── utils/
+│           ├── cache.py
+│           └── rate_limit.py
+└── tests/
+    └── ...
+```
+
+## ✅ Working Agreement — How I Want Claude Code to Behave
+
+1. **Teach, don't just ship.** When introducing a new library or pattern, give me a 3-5 sentence explanation of what it does and why we're using it BEFORE writing code.
+
+2. **One phase at a time.** Do not implement Phase 2 features while we're in Phase 1. If I ask for something out of order, remind me.
+
+3. **Small steps.** Prefer one tool / one feature per commit. I want to understand each change.
+
+4. **Explain the "why" on architecture decisions.** If you make a design choice (file structure, async vs sync, etc.), tell me why.
+
+5. **Flag new concepts.** If we're about to use something I haven't seen before (e.g., async context managers, Pydantic validators), pause and explain first.
+
+6. **Ask before assuming.** If a requirement is ambiguous (e.g., "how should cart expiry work"), ask me instead of picking silently.
+
+7. **Show me commands.** When running `uv add X` or similar, show the exact command so I learn the tool, not just the result.
+
+8. **Don't skip validation.** Every tool must have Pydantic input validation. No exceptions, even for "simple" tools.
+
+9. **Commit discipline.** Suggest git commits at logical checkpoints with clear messages.
+
+10. **Test as we go.** When we build a tool, also write or suggest a basic test for it before moving on.
+
+## 🚫 Anti-Patterns (Things to Avoid)
+
+- ❌ Using `print()` anywhere in the server code
+- ❌ Hardcoding API keys or URLs
+- ❌ Generic `except Exception:` handlers that swallow errors
+- ❌ Skipping Pydantic validation "because it's just a demo"
+- ❌ Introducing a library without explaining it
+- ❌ Building multiple phases in one sitting without checkpoints
+- ❌ Over-engineering — no microservices, no Docker yet, no Kubernetes
+
+## 🔮 Future Considerations (Not Committed Yet)
+ 
+These are **possible future phases** I'm considering but haven't committed to. Claude Code should keep these in mind when making design choices in earlier phases, so we don't paint ourselves into a corner.
+ 
+### Possibly: OIDC Authentication (Phase 6.5)
+Adding "Sign in with provider" (likely Microsoft Entra ID / Azure AD, Google, or Auth0) using OAuth 2.1 + OIDC. The MCP spec supports this natively. Would add real enterprise-grade authentication to the server.
+ 
+### Possibly: Role-Based Access Control (Phase 6.6)
+Roles like `guest` (search only), `user` (search + favorites + simulated booking), `manager`, `admin`. Tools would check permissions before executing. Would include audit logging.
+ 
+### Forward-Compatible Design Choices (Apply NOW)
+Even though we haven't committed to auth, make these choices in earlier phases so we can add it later without major refactoring:
+ 
+1. **Store data under a `user_id` field from day one** — even if it's hardcoded to `"default_user"` in Phase 4 (favorites) and Phase 5 (bookings). Do NOT use a global `favorites.json` with no user namespace.
+2. **Design tool signatures with an implicit user context in mind** — avoid patterns that assume a single-user server.
+3. **Keep tool logic separate from auth logic** — tools should not contain auth checks directly. If auth is added later, it will be middleware/decorator-based.
+4. **Never log PII even in dev mode** — get the habit in now, so adding real user data later doesn't require a logging audit.
+5. **Design the storage layer with multi-user queries in mind** — e.g., `get_favorites(user_id)` not `get_favorites()`.
+**Decision point:** Revisit this after Phase 6 is complete. If I want to add auth, these choices make it a clean extension rather than a rewrite.
+
+## 📚 Key References
+
+- **MCP Spec:** https://modelcontextprotocol.io/specification/latest
+- **Python SDK:** https://github.com/modelcontextprotocol/python-sdk
+- **FastMCP docs:** https://github.com/modelcontextprotocol/python-sdk#quickstart
+- **Ticketmaster API:** https://developer.ticketmaster.com/products-and-docs/apis/discovery-api/v2/
+- **MCP Inspector:** https://github.com/modelcontextprotocol/inspector
+- **Pydantic v2 docs:** https://docs.pydantic.dev/latest/
+
+## 🎬 Where We Are Right Now
+
+**Status:** Phase 0 ✅ and Phase 1 ✅ complete. Moving into Phase 2.
+
+**Phase 1 outcome:**
+- Project initialized with `uv` (`pyproject.toml`, `uv.lock`, `.venv`)
+- `mcp[cli]` SDK installed
+- `src/events_mcp/server.py` exists with a single working `hello` tool using `FastMCP` + Pydantic `Field` validation
+- Server registered with the **Claude Code CLI** (Linux — Claude Desktop is not officially available on Linux) via:
+  `claude mcp add events-mcp -- uv run --directory "<project>" events-mcp`
+- Verified live: `hello` tool was successfully called from a Claude session and returned the expected response
+
+**Next immediate step (Phase 2):** Add `.env` + `python-dotenv` for the Ticketmaster API key, then build the first real tool: `search_events`. We'll introduce `httpx` (async HTTP) and Pydantic models for the API response.
+
+**What I've already done:**
+- Installed Python 3.11+, `uv`, Node.js 20+, VS Code with Python extension
+- Created a Ticketmaster developer account and obtained an API key (stored securely, not in repo yet)
+- Set up GitHub account
+- (Linux note: using Claude Code CLI instead of Claude Desktop)
+
+**Reference doc:** See `LEARNINGS.md` in the repo root for an indexed reference of every concept covered so far and what's planned ahead.
