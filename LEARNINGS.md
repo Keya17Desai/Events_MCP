@@ -130,25 +130,49 @@ FastMCP automatically:
 
 ---
 
-### Pydantic `Field` for Input Validation
+### Pydantic `Field` for Input Validation — use `Annotated`
 
-When you annotate a tool parameter with `Field(...)`, FastMCP enforces those constraints before your function runs. The LLM never even reaches your code if the input is invalid.
+The modern Pydantic v2 + FastMCP idiom uses `typing.Annotated` to attach validation metadata to a parameter type without changing its default value:
 
 ```python
+from typing import Annotated
 from pydantic import Field
 
 @mcp.tool()
 def hello(
-    name: str = Field(..., description="Your name", min_length=1, max_length=100),
+    name: Annotated[str, Field(description="Your name", min_length=1, max_length=100)],
 ) -> str:
+    ...
+
+@mcp.tool()
+async def search_events(
+    city: Annotated[str | None, Field(description="City name")] = None,
+    size: Annotated[int, Field(description="Results per page", ge=1, le=50)] = 10,
+) -> SearchEventsResult:
     ...
 ```
 
-- `...` (Ellipsis) = required field, no default
+- `Annotated[T, Field(...)]` = the type is `T`; the `Field(...)` is metadata
 - `description` = shown to the LLM in the tool schema (very important — this is how the AI knows what to pass)
-- `min_length` / `max_length` = enforced automatically, raises a validation error if violated
+- `min_length` / `max_length` / `ge` / `le` = enforced automatically before your function runs
+- The default value (after `=`) is a *real* Python default
 
-**Rule:** Every tool parameter in this project uses `Field(...)`. No bare `str` or `int` without constraints.
+**Rule:** Every tool parameter in this project uses `Annotated[T, Field(...)]`. No bare `str` or `int` without metadata.
+
+#### ⚠️ Gotcha: don't use `param: T = Field(default, ...)` directly
+
+The older-looking pattern works inside FastMCP but **breaks when the function is called directly from Python** (e.g., a smoke test):
+
+```python
+# ❌ BAD — looks fine, but breaks direct calls
+async def search_events(keyword: str | None = Field(None, description="...")):
+    if keyword:  # ⚠️ keyword is a FieldInfo object, not None! Truthy → always enters branch
+        ...
+```
+
+This is because `Field(None, ...)` returns a `FieldInfo` object. FastMCP knows how to interpret it as "default = None", but a regular Python call sees the `FieldInfo` itself as the parameter value. Result: `if keyword:` is always true, and you end up sending garbage values to your downstream API.
+
+**Always use `Annotated[T, Field(...)] = real_default` instead.** We hit this exact bug on the first run of `search_events` — the smoke test sent `start_date_time=PydanticUndefined` to Ticketmaster and got a 400 error.
 
 ---
 

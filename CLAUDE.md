@@ -234,22 +234,27 @@ Even though we haven't committed to auth, make these choices in earlier phases s
 
 ## 🎬 Where We Are Right Now
 
-**Status:** Phase 0 ✅ and Phase 1 ✅ complete. Moving into Phase 2.
+**Status:** Phases 0 ✅, 1 ✅, and 2 ✅ complete. Moving into Phase 3.
 
 **Phase 1 outcome:**
 - Project initialized with `uv` (`pyproject.toml`, `uv.lock`, `.venv`)
 - `mcp[cli]` SDK installed
-- `src/events_mcp/server.py` exists with a single working `hello` tool using `FastMCP` + Pydantic `Field` validation
-- Server registered with the **Claude Code CLI** (Linux — Claude Desktop is not officially available on Linux) via:
-  `claude mcp add events-mcp -- uv run --directory "<project>" events-mcp`
-- Verified live: `hello` tool was successfully called from a Claude session and returned the expected response
+- `src/events_mcp/server.py` with a `hello` tool using `FastMCP` + Pydantic
+- Server registered via Claude Code CLI (Linux — no official Claude Desktop)
 
-**Next immediate step (Phase 2):** Add `.env` + `python-dotenv` for the Ticketmaster API key, then build the first real tool: `search_events`. We'll introduce `httpx` (async HTTP) and Pydantic models for the API response.
+**Phase 2 outcome:**
+- `.env` + `python-dotenv` for secret management; `.env.example` committed as template
+- `events_mcp.config` module with cached, validated `Settings` (`get_settings()`)
+- `events_mcp.clients.ticketmaster.TicketmasterClient` — async `httpx` wrapper, used as an async context manager
+- Pydantic response models in `events_mcp.models` (`events.py`, `venues.py`, `attractions.py`)
+- 4 discovery tools wired into MCP: `search_events`, `get_event_details`, `search_venues`, `search_attractions`
+- Smoke tests in `scripts/` exercise the live API end-to-end
 
-**What I've already done:**
-- Installed Python 3.11+, `uv`, Node.js 20+, VS Code with Python extension
-- Created a Ticketmaster developer account and obtained an API key (stored securely, not in repo yet)
-- Set up GitHub account
-- (Linux note: using Claude Code CLI instead of Claude Desktop)
+**Conventions established in Phase 2 (apply going forward):**
+- All tool params use `Annotated[T, Field(...)] = default` — never `T = Field(default, ...)` directly. The latter breaks when the function is called outside FastMCP (we hit the bug live; see LEARNINGS.md).
+- Tools receive raw API JSON via the client, transform to Pydantic via `Model.from_api_X(raw)` classmethods, then return the model. Tools never expose raw API shapes to the LLM.
+- Each tool spins up its own `TicketmasterClient` for now. Optimization (long-lived shared client + caching) is Phase 3.
 
-**Reference doc:** See `LEARNINGS.md` in the repo root for an indexed reference of every concept covered so far and what's planned ahead.
+**Next immediate step (Phase 3):** Add caching (`cachetools`) and rate limiting (`aiolimiter`) so we stay within Ticketmaster's 5000/day quota. Add `structlog` for structured logging to stderr. Tighten Pydantic models with `.strict()`.
+
+**Reference doc:** See `LEARNINGS.md` for an indexed reference of every concept covered so far and what's planned ahead.

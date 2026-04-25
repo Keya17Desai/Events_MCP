@@ -1,18 +1,36 @@
+from typing import Annotated
+
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
+from events_mcp.tools.discovery import (
+    get_event_details,
+    search_attractions,
+    search_events,
+    search_venues,
+)
+
 mcp = FastMCP(
     "Events MCP",
-    instructions="A server for discovering and booking live events. Currently in Phase 1 (hello world).",
+    instructions=(
+        "A server for discovering live events (concerts, sports, theater, festivals). "
+        "Use search_events to find events by city, keyword, category, or date."
+    ),
 )
 
 
 @mcp.tool()
 def hello(
-    name: str = Field(..., description="Your name", min_length=1, max_length=100),
+    name: Annotated[str, Field(description="Your name", min_length=1, max_length=100)],
 ) -> str:
     """Say hello. Use this to verify the Events MCP server is running and connected."""
     return f"Hello, {name}! The Events MCP server is live and ready."
+
+
+mcp.tool()(search_events)
+mcp.tool()(get_event_details)
+mcp.tool()(search_venues)
+mcp.tool()(search_attractions)
 
 
 def main() -> None:

@@ -5,7 +5,9 @@ description = "MCP server for live event discovery and booking simulation"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "httpx>=0.28.1",
     "mcp[cli]>=1.27.0",
+    "python-dotenv>=1.2.2",
 ]
 
 [project.scripts]
