@@ -234,7 +234,7 @@ Even though we haven't committed to auth, make these choices in earlier phases s
 
 ## 🎬 Where We Are Right Now
 
-**Status:** Phases 0 ✅, 1 ✅, and 2 ✅ complete. Moving into Phase 3.
+**Status:** Phases 0 ✅, 1 ✅, 2 ✅, and 3 ✅ complete. Moving into Phase 4.
 
 **Phase 1 outcome:**
 - Project initialized with `uv` (`pyproject.toml`, `uv.lock`, `.venv`)
@@ -250,11 +250,25 @@ Even though we haven't committed to auth, make these choices in earlier phases s
 - 4 discovery tools wired into MCP: `search_events`, `get_event_details`, `search_venues`, `search_attractions`
 - Smoke tests in `scripts/` exercise the live API end-to-end
 
+**Phase 3 outcome:**
+- `events_mcp.logging` — structlog config, stderr-only, TTY → ConsoleRenderer / non-TTY → JSONRenderer, idempotent `configure_logging()`
+- Module-level `AsyncLimiter(4, 1)` in `clients/ticketmaster.py` — shared across every client instance
+- Two module-level `TTLCache`s: `_SEARCH_CACHE` (300s) for searches, `_DETAIL_CACHE` (900s) for event details
+- All tool input `Field(...)`s now use `strict=True` — type coercion (e.g. `"10"` → `10`) is rejected
+- Logs scrub the API key by recording `user_params`, never `merged_params`
+- Smoke tests added: `smoke_test_rate_limit.py`, `smoke_test_cache.py`, `smoke_test_strict_mode.py`
+
 **Conventions established in Phase 2 (apply going forward):**
 - All tool params use `Annotated[T, Field(...)] = default` — never `T = Field(default, ...)` directly. The latter breaks when the function is called outside FastMCP (we hit the bug live; see LEARNINGS.md).
 - Tools receive raw API JSON via the client, transform to Pydantic via `Model.from_api_X(raw)` classmethods, then return the model. Tools never expose raw API shapes to the LLM.
-- Each tool spins up its own `TicketmasterClient` for now. Optimization (long-lived shared client + caching) is Phase 3.
+- Each tool spins up its own `TicketmasterClient` for now. Long-lived shared client is a Phase 4+ concern.
 
-**Next immediate step (Phase 3):** Add caching (`cachetools`) and rate limiting (`aiolimiter`) so we stay within Ticketmaster's 5000/day quota. Add `structlog` for structured logging to stderr. Tighten Pydantic models with `.strict()`.
+**Conventions established in Phase 3 (apply going forward):**
+- Every tool input `Field(...)` includes `strict=True`.
+- Cross-instance state (rate limiter, caches) lives at **module level**, not on the client instance, until we have a long-lived shared client.
+- Log calls use `lower_snake_case` past-tense event names (`tool_completed`, `cache_hit`, `ticketmaster_request`). Never log `merged_params` — only `user_params`.
+- Anything new that needs visibility gets a structured log call, not a `print()`.
+
+**Next immediate step (Phase 4):** Add `tinydb` for local persistence. Build `save_favorite`, `list_favorites`, `remove_favorite`, `set_preferences`, `get_preferences`, `get_recommendations`. Expose favorites as an MCP Resource. All storage namespaced under a `user_id` (hardcoded `"default_user"` for now, per forward-compat design).
 
 **Reference doc:** See `LEARNINGS.md` for an indexed reference of every concept covered so far and what's planned ahead.

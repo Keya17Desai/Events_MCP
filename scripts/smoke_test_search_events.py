@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 
+from events_mcp.logging import configure_logging
 from events_mcp.tools.discovery import search_events
 
 
 async def main() -> None:
+    configure_logging()
     result = await search_events(city="New York", size=3)
     print(f"Total matching: {result.total_results}, showing {len(result.events)}")
     for event in result.events:

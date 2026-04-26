@@ -241,27 +241,258 @@ This is the path we took on this Linux machine.
 
 ---
 
-## Phase 2 — Ticketmaster Integration (upcoming)
+## Phase 2 — Ticketmaster Integration
 
-### Concepts we'll learn:
+### `python-dotenv` + a cached `Settings` object
 
-| Concept | What it is |
-|---|---|
-| `httpx` | Async HTTP client (like `requests` but async-native). We use it to call the Ticketmaster API. |
-| `async` / `await` | Python's concurrency model. Lets the server handle waiting for HTTP responses without blocking. |
-| `python-dotenv` | Loads `.env` file into environment variables. Keeps secrets out of code. |
-| Pydantic models | Full classes that validate and parse API response JSON into typed Python objects. |
-| Async context managers | `async with httpx.AsyncClient() as client:` — ensures the HTTP connection is properly cleaned up. |
+Secrets like API keys must never be hardcoded. The pattern we used:
+
+1. `.env` file at project root holds `TICKETMASTER_API_KEY=...` (gitignored).
+2. `.env.example` is committed as a template — same keys, no values.
+3. `python-dotenv`'s `load_dotenv()` reads `.env` into `os.environ` at import time.
+4. A Pydantic `Settings` model validates the loaded values.
+5. `get_settings()` is wrapped in `@lru_cache(maxsize=1)` so validation runs once and the same instance is reused everywhere.
+
+```python
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    api_key = os.environ.get("TICKETMASTER_API_KEY")
+    if api_key is None:
+        raise RuntimeError("Missing TICKETMASTER_API_KEY...")
+    return Settings(ticketmaster_api_key=api_key)
+```
+
+**Why a Pydantic `BaseModel` instead of just reading `os.environ` everywhere?** Validation in one place. If the key is missing or too short, the server fails fast with a clear error at startup, not deep inside an HTTP call. `model_config = {"frozen": True}` makes the settings immutable — you can't accidentally mutate config at runtime.
+
+**Why `lru_cache`?** Cheap memoization for a function that takes no args. Saves re-parsing on every call and gives you a single canonical config object.
 
 ---
 
-## Phase 3 — Robustness (upcoming)
+### `httpx.AsyncClient` as an async context manager
 
-| Concept | What it is |
-|---|---|
-| `cachetools` | In-memory cache with TTL (time-to-live). Avoids hitting the API for the same query twice in N minutes. |
-| `aiolimiter` | Async rate limiter. Ensures we never exceed Ticketmaster's 5 req/sec limit. |
-| `structlog` | Structured logging library. Logs as JSON (key=value pairs) instead of plain strings — easier to filter and parse. Writes to stderr, never stdout. |
+`httpx` is the async-native successor to `requests`. The key idea is the **connection pool**: rather than opening a new TCP connection per request, the client keeps connections alive and reuses them. That pool needs to be closed cleanly, which is why we use it as an async context manager:
+
+```python
+async with TicketmasterClient(api_key=...) as client:
+    data = await client.search_events_raw(keyword="Coldplay")
+# pool is closed here, even if an exception was raised inside
+```
+
+The `__aenter__` / `__aexit__` methods are the async equivalent of `__enter__` / `__exit__`. `async with` is to `with` what `await` is to a normal call — same shape, but it suspends instead of blocking.
+
+Inside our wrapper:
+- `httpx.AsyncClient(base_url=..., timeout=...)` creates the pool.
+- `await self._client.aclose()` shuts it down.
+- Auth is injected per-request by merging `{"apikey": self._api_key}` into the query params, so callers never touch the key.
+
+**Why a wrapper class instead of using `httpx` directly in tools?** Three reasons: (1) auth is centralized — tools don't see the key, (2) error handling is uniform — one place to catch `httpx.HTTPError` and raise our own `TicketmasterAPIError`, (3) when Phase 3 adds caching and rate limiting, those layers slot into the wrapper without touching tool code.
+
+---
+
+### `async` / `await` in 60 seconds
+
+Python coroutines are functions defined with `async def` that *don't run* when called — they return a coroutine object. You execute them by `await`-ing inside another coroutine, or by handing them to an event loop (`asyncio.run(...)`).
+
+```python
+async def fetch():
+    response = await client.get(url)   # suspends here, lets other tasks run
+    return response.json()
+```
+
+While `await client.get(...)` is waiting on the network, the event loop can service other coroutines. For an MCP server this matters because tools spend most of their time blocked on HTTP calls — `async` lets a single process handle multiple in-flight tool calls without threads.
+
+FastMCP supports `async def` tool functions natively. Just declare them async and `await` your I/O.
+
+---
+
+### The `from_api_X` classmethod pattern
+
+Ticketmaster responses are deeply nested and noisy — there are dozens of fields, half of them optional, and the structure is built around HAL `_embedded` links. We don't want the LLM seeing that shape. So every Pydantic model exposes a flat, LLM-friendly schema, and a classmethod handles the transformation:
+
+```python
+class EventSummary(BaseModel):
+    id: str
+    name: str
+    venue_name: str | None = None
+    city: str | None = None
+    # ... flat fields only
+
+    @classmethod
+    def from_api_event(cls, raw: dict[str, Any]) -> EventSummary:
+        venues = (raw.get("_embedded") or {}).get("venues") or []
+        venue = venues[0] if venues else {}
+        return cls(
+            id=raw["id"],
+            name=raw.get("name", ""),
+            venue_name=venue.get("name"),
+            city=(venue.get("city") or {}).get("name"),
+            ...
+        )
+```
+
+**Why a classmethod and not a free function or a Pydantic validator?** Classmethods keep the transform colocated with the model it produces — find the model, find how it's built. They also let subclasses override the transform: `EventDetail.from_api_event` calls `EventSummary.from_api_event` first and then layers on the extra fields. (See `EventDetail` for that pattern in action.)
+
+**Why `(raw.get("_embedded") or {}).get(...)` everywhere?** Because Ticketmaster sometimes returns a key with value `None` instead of omitting it. `raw.get("_embedded", {})` returns `None` in that case, and chaining `.get()` on `None` crashes. The `or {}` idiom handles both "missing" and "explicitly null" in one shot.
+
+---
+
+### Tools transform raw → model, never expose raw
+
+The convention established in Phase 2:
+
+```
+LLM → MCP tool → TicketmasterClient (returns raw JSON dict)
+                 → Model.from_api_X(raw)         ← transform happens here
+                 → return Model                  ← LLM sees only the clean shape
+```
+
+Tools are thin: validate inputs, call the client, run `from_api_X`, return. They never pass raw API JSON back to the LLM. This keeps the tool surface stable even if Ticketmaster changes their response shape — only the `from_api_X` methods need to update.
+
+---
+
+### One client per tool call (for now)
+
+Each tool currently does:
+
+```python
+async with TicketmasterClient(api_key=...) as client:
+    raw = await client.search_events_raw(...)
+```
+
+This means we open and close a connection pool per tool invocation. **That's wasteful** — pool reuse is the whole point of `httpx.AsyncClient`. We're doing it anyway for Phase 2 because (a) it's simple, (b) it makes each tool independently testable, and (c) the optimization is exactly what Phase 3 is for. In Phase 3 we'll lift the client to a long-lived module-level singleton with a shared cache and rate limiter sitting in front of it.
+
+**Lesson:** premature optimization can make Phase 1 harder to reason about. Start dumb, optimize when you have the surrounding machinery (caching, rate limiting) that benefits from it.
+
+---
+
+### Pydantic gotcha that hit us live
+
+We already flagged this in Phase 1, but it bit us for real in Phase 2 — worth re-noting because the failure mode is silent until the API rejects you:
+
+```python
+# ❌ BAD — works under FastMCP, breaks when called directly
+async def search_events(keyword: str | None = Field(None, description="...")):
+    if keyword:  # FieldInfo is truthy! Always enters this branch.
+        params["keyword"] = keyword  # sends a FieldInfo object to httpx
+```
+
+`Field(None, ...)` returns a `FieldInfo` instance. FastMCP's tool dispatcher knows to interpret that as "default = None", but a direct Python call (like our `scripts/` smoke tests) sees `FieldInfo` as the actual argument value. The result was `keyword=PydanticUndefined` flying out to Ticketmaster, which 400'd.
+
+**Always:** `param: Annotated[T, Field(...)] = real_default`. Defaults live to the right of `=`, descriptions live inside `Field(...)`. They never share a slot.
+
+---
+
+## Phase 3 — Robustness
+
+### `structlog` — structured logging to stderr
+
+Plain `logging.info("got 5 events for Mumbai")` is a wall of strings. structlog writes **events with key-value context** instead: `log.info("search_completed", city="Mumbai", count=5, cache_hit=False)`. Each call emits a record with timestamp, level, event name, and arbitrary fields you bind. That's grep-friendly and parser-friendly.
+
+Two output modes, picked automatically based on `sys.stderr.isatty()`:
+- **TTY (terminal):** `ConsoleRenderer` — colored, human-readable, key=value pairs on one line.
+- **Non-TTY (Claude Desktop, redirect, pipe):** `JSONRenderer` — one JSON object per line. Trivial to ship to a log aggregator later.
+
+```python
+configure_logging()
+log = get_logger(__name__)
+log.info("ticketmaster_request", path="events.json", status=200, duration_ms=345)
+```
+
+**Critical rule for stdio MCP servers:** all log output goes to **stderr**. stdout is owned by the JSON-RPC protocol — anything written there will corrupt the message stream and break the connection. We enforce this with `PrintLoggerFactory(file=sys.stderr)`. There is no path in our codebase that writes to stdout.
+
+**API key safety in logs:** the client logs `user_params` (the dict the tool passed in), not `merged_params` (which has `apikey` injected). The key never appears in any log line.
+
+#### `configure_logging()` is idempotent
+
+We guard with a module-level `_configured` flag so multiple calls are a no-op. Reason: tests and scripts can each call `configure_logging()` defensively without risk.
+
+#### Convention for event names
+
+Use `lower_snake_case` past-tense verbs for what happened: `cache_hit`, `cache_miss`, `ticketmaster_request`, `tool_completed`. Keep them short and consistent so log filters work cleanly.
+
+---
+
+### `aiolimiter` — async rate limiter
+
+Ticketmaster allows 5 req/sec. We cap at 4/sec to leave headroom for retries and clock skew. `aiolimiter.AsyncLimiter(max_rate, time_period)` is an async context manager:
+
+```python
+async with _RATE_LIMITER:
+    response = await self._client.get(...)
+```
+
+If acquiring the limiter would exceed the rate, the `async with` **suspends** the coroutine until a slot frees up. This composes with `httpx`'s async model — concurrent tool calls naturally queue at the limiter rather than blocking a thread.
+
+#### Why module-level, not per-client
+
+The limiter is a module-scoped singleton in `clients/ticketmaster.py`:
+
+```python
+_RATE_LIMITER = AsyncLimiter(max_rate=4, time_period=1)
+```
+
+We currently spin up a new `TicketmasterClient` per tool call. If the limiter lived on the instance, four simultaneous tool calls would each get their own 4/sec budget — 16/sec across the process, instantly violating the API quota. A module-level limiter is shared across every client instance, which is the only correct shape until Phase 4+ introduces a long-lived client.
+
+#### Rate limiter ≠ throughput limiter
+
+Smoke test: 8 concurrent search calls took 2.24s wall time. Naïve math says "4/sec → should take 2 seconds for 8 calls", which is roughly right. But it's worth understanding *why*: the limiter governs **acquire time**, not response time. Each individual request still takes ~1.4s of network latency. The limiter just delays when each one is allowed to start.
+
+---
+
+### `cachetools` — TTL cache for repeated queries
+
+In-memory cache with time-based expiry. `TTLCache(maxsize=N, ttl=seconds)` is dict-like — entries auto-evict when their TTL elapses or when the cache hits its size cap.
+
+We use **two caches**:
+- `_SEARCH_CACHE` — `ttl=300` (5 min). Used by `search_events`, `search_venues`, `search_attractions`. Listings change slowly.
+- `_DETAIL_CACHE` — `ttl=900` (15 min). Used by `get_event_details`. Single events change even less often.
+
+Both are module-level for the same shared-singleton reason as the limiter.
+
+#### Cache key construction
+
+```python
+key = (path, tuple(sorted(user_params.items())))
+```
+
+Two pieces matter here:
+1. **Path is part of the key.** Without it, a `search_events` query with `{"size": 10}` would collide with a `search_venues` query with `{"size": 10}`.
+2. **`sorted(items())` makes the dict order-independent.** Python dicts preserve insertion order, so `{"a": 1, "b": 2}` and `{"b": 2, "a": 1}` would otherwise produce different tuple keys for the same logical query.
+
+The API key is **not** part of the cache key — we cache against `user_params`, not `merged_params`, so two different deployments using the same key wouldn't share cache entries (they'd each have their own process-local cache anyway, but the principle holds).
+
+#### Cache layering with the rate limiter
+
+Order in `_cached_get`: cache lookup → cache miss → `_get` (which acquires the rate limiter) → cache write. So **cache hits don't consume rate-limit budget**. This is the whole point: the cache is in front of the network, not in front of the limiter alone.
+
+Smoke test: identical query twice — first call 1469ms (network), second 51ms (cache only, no network). 29× speedup, zero extra quota spent.
+
+---
+
+### Pydantic strict mode — reject type coercion
+
+By default Pydantic *coerces* values: `"10"` → `10`, `"true"` → `True`. Convenient for HTTP forms, dangerous for LLM inputs — a hallucinated string would silently become a valid int.
+
+Strict mode (`Field(strict=True, ...)`) rejects coercion outright:
+
+```
+Lenient with '10':       10 (coerced!)
+Strict with '10':        rejected — Input should be a valid integer
+```
+
+We applied `strict=True` to **every** `Field(...)` on every tool input parameter. Range constraints (`ge`, `le`, `min_length`) still apply on top — they're orthogonal to strict mode.
+
+#### Why only on tool inputs, not response models
+
+Tool inputs are the LLM-facing boundary — they're the place where bad data enters the system. Response models (`EventSummary`, `VenueSummary`, etc.) are constructed from API JSON via explicit `from_api_X` classmethods; we already control the types coming out of those transforms, so strict mode wouldn't catch new bugs and might break on edge cases (e.g., the API returning a numeric string for a numeric field).
+
+---
+
+### What we did NOT do this phase
+
+- **No retries.** A 500 from Ticketmaster currently surfaces as a tool error. Adding `tenacity`-style retry-with-backoff is a future-phase concern, not a robustness must-have for the learning project.
+- **No long-lived shared client.** Each tool still does `async with TicketmasterClient(...)`. The cache and rate limiter are module-level so this remains correct. Lifting the client to a singleton becomes worthwhile when we add resources/state in Phase 4.
+- **No log level config from env.** Hardcoded `INFO` for now. Trivial to add `LOG_LEVEL` env var later if needed.
 
 ---
 

@@ -7,19 +7,28 @@ from pydantic import Field
 
 from events_mcp.clients.ticketmaster import TicketmasterClient
 from events_mcp.config import get_settings
+from events_mcp.logging import get_logger
 from events_mcp.models.attractions import AttractionSummary, SearchAttractionsResult
 from events_mcp.models.events import EventDetail, EventSummary, SearchEventsResult
 from events_mcp.models.venues import SearchVenuesResult, VenueSummary
+
+log = get_logger(__name__)
 
 
 async def search_events(
     keyword: Annotated[
         str | None,
-        Field(description="Free-text search across event name, artist, team, etc."),
+        Field(
+            description="Free-text search across event name, artist, team, etc.",
+            strict=True,
+        ),
     ] = None,
     city: Annotated[
         str | None,
-        Field(description="City name, e.g. 'Mumbai', 'New York', 'London'"),
+        Field(
+            description="City name, e.g. 'Mumbai', 'New York', 'London'",
+            strict=True,
+        ),
     ] = None,
     country_code: Annotated[
         str | None,
@@ -27,27 +36,46 @@ async def search_events(
             description="ISO country code (uppercase), e.g. 'US', 'IN', 'GB'",
             min_length=2,
             max_length=2,
+            strict=True,
         ),
     ] = None,
     classification: Annotated[
         str | None,
-        Field(description="Top-level category: 'music', 'sports', 'arts', or 'family'"),
+        Field(
+            description="Top-level category: 'music', 'sports', 'arts', or 'family'",
+            strict=True,
+        ),
     ] = None,
     start_date_time: Annotated[
         str | None,
-        Field(description="Earliest event start, ISO 8601 (e.g. '2026-04-25T00:00:00Z')"),
+        Field(
+            description="Earliest event start, ISO 8601 (e.g. '2026-04-25T00:00:00Z')",
+            strict=True,
+        ),
     ] = None,
     end_date_time: Annotated[
         str | None,
-        Field(description="Latest event start, ISO 8601 (e.g. '2026-05-01T00:00:00Z')"),
+        Field(
+            description="Latest event start, ISO 8601 (e.g. '2026-05-01T00:00:00Z')",
+            strict=True,
+        ),
     ] = None,
     size: Annotated[
         int,
-        Field(description="Number of results per page (1-50)", ge=1, le=50),
+        Field(
+            description="Number of results per page (1-50)",
+            ge=1,
+            le=50,
+            strict=True,
+        ),
     ] = 10,
     page: Annotated[
         int,
-        Field(description="Zero-indexed page number for pagination", ge=0),
+        Field(
+            description="Zero-indexed page number for pagination",
+            ge=0,
+            strict=True,
+        ),
     ] = 0,
 ) -> SearchEventsResult:
     """Search live events on Ticketmaster.
@@ -78,12 +106,19 @@ async def search_events(
     events = [EventSummary.from_api_event(e) for e in raw_events]
 
     page_info = data.get("page") or {}
-    return SearchEventsResult(
+    result = SearchEventsResult(
         events=events,
         total_results=page_info.get("totalElements", len(events)),
         page=page_info.get("number", page),
         page_size=page_info.get("size", size),
     )
+    log.info(
+        "tool_completed",
+        tool="search_events",
+        returned=len(events),
+        total_results=result.total_results,
+    )
+    return result
 
 
 async def get_event_details(
@@ -92,6 +127,7 @@ async def get_event_details(
         Field(
             description="Ticketmaster event id (use the id from search_events results)",
             min_length=1,
+            strict=True,
         ),
     ],
 ) -> EventDetail:
@@ -103,17 +139,19 @@ async def get_event_details(
     settings = get_settings()
     async with TicketmasterClient(settings.ticketmaster_api_key) as client:
         data = await client.get_event_raw(event_id)
-    return EventDetail.from_api_event(data)
+    detail = EventDetail.from_api_event(data)
+    log.info("tool_completed", tool="get_event_details", event_id=event_id)
+    return detail
 
 
 async def search_venues(
     keyword: Annotated[
         str | None,
-        Field(description="Free-text search across venue names"),
+        Field(description="Free-text search across venue names", strict=True),
     ] = None,
     city: Annotated[
         str | None,
-        Field(description="City name, e.g. 'Mumbai', 'Chicago'"),
+        Field(description="City name, e.g. 'Mumbai', 'Chicago'", strict=True),
     ] = None,
     country_code: Annotated[
         str | None,
@@ -121,15 +159,16 @@ async def search_venues(
             description="ISO country code (uppercase), e.g. 'US', 'IN'",
             min_length=2,
             max_length=2,
+            strict=True,
         ),
     ] = None,
     size: Annotated[
         int,
-        Field(description="Results per page (1-50)", ge=1, le=50),
+        Field(description="Results per page (1-50)", ge=1, le=50, strict=True),
     ] = 10,
     page: Annotated[
         int,
-        Field(description="Zero-indexed page number", ge=0),
+        Field(description="Zero-indexed page number", ge=0, strict=True),
     ] = 0,
 ) -> SearchVenuesResult:
     """Search for venues (concert halls, stadiums, theaters).
@@ -153,30 +192,43 @@ async def search_venues(
     venues = [VenueSummary.from_api_venue(v) for v in raw_venues]
 
     page_info = data.get("page") or {}
-    return SearchVenuesResult(
+    result = SearchVenuesResult(
         venues=venues,
         total_results=page_info.get("totalElements", len(venues)),
         page=page_info.get("number", page),
         page_size=page_info.get("size", size),
     )
+    log.info(
+        "tool_completed",
+        tool="search_venues",
+        returned=len(venues),
+        total_results=result.total_results,
+    )
+    return result
 
 
 async def search_attractions(
     keyword: Annotated[
         str | None,
-        Field(description="Free-text search (artist, team, or performer name)"),
+        Field(
+            description="Free-text search (artist, team, or performer name)",
+            strict=True,
+        ),
     ] = None,
     classification: Annotated[
         str | None,
-        Field(description="Category: 'music', 'sports', 'arts', or 'family'"),
+        Field(
+            description="Category: 'music', 'sports', 'arts', or 'family'",
+            strict=True,
+        ),
     ] = None,
     size: Annotated[
         int,
-        Field(description="Results per page (1-50)", ge=1, le=50),
+        Field(description="Results per page (1-50)", ge=1, le=50, strict=True),
     ] = 10,
     page: Annotated[
         int,
-        Field(description="Zero-indexed page number", ge=0),
+        Field(description="Zero-indexed page number", ge=0, strict=True),
     ] = 0,
 ) -> SearchAttractionsResult:
     """Search for attractions: artists, teams, or performers.
@@ -198,9 +250,16 @@ async def search_attractions(
     attractions = [AttractionSummary.from_api_attraction(a) for a in raw_attractions]
 
     page_info = data.get("page") or {}
-    return SearchAttractionsResult(
+    result = SearchAttractionsResult(
         attractions=attractions,
         total_results=page_info.get("totalElements", len(attractions)),
         page=page_info.get("number", page),
         page_size=page_info.get("size", size),
     )
+    log.info(
+        "tool_completed",
+        tool="search_attractions",
+        returned=len(attractions),
+        total_results=result.total_results,
+    )
+    return result
