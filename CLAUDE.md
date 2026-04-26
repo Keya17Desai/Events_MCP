@@ -37,6 +37,8 @@ Users will interact with it through Claude Desktop (or any MCP-compatible AI cli
 | Type checking | `mypy` |
 | Transport Phase 1 | stdio |
 | Transport Phase 6 | Streamable HTTP |
+| Email | `resend` (Phase 5.5 — free tier, 100/day) |
+| Calendar | `ics` (iCalendar file format, Phase 5.5) |
 | Data source | Ticketmaster Discovery API (free tier, 5000 calls/day) |
 
 ## 📊 Data Source Details
@@ -91,10 +93,21 @@ Covered: MCP primitives, JSON-RPC, transports, tool-calling loop, security minds
 - Tighten all Pydantic schemas with `.strict()`
 - **Goal:** Stay within API quota, handle errors gracefully
 
+### Phase 3.5 — MCP Surface Polish & Sorting
+- Add four MCP **Prompts** (server-side reusable templates the user invokes via slash commands):
+  - `event_night_plan(city, date, budget?)` — itinerary builder
+  - `genre_picks(genre, city)` — curated picks for a genre fan
+  - `compare_events(event_id_a, event_id_b)` — side-by-side comparison
+  - `surprise_me(city)` — random event with a one-line pitch
+- Add a `sort` parameter to `search_events`, `search_venues`, `search_attractions`
+  - Typed as `Literal[...]` of Ticketmaster's allowed sort values
+  - Strict mode rejects anything else; default left empty (Ticketmaster picks)
+- **Goal:** Cover MCP Prompts as a primitive; let users control result ordering
+
 ### Phase 4 — User Context & State
 - Add `tinydb` for local persistence
 - Build `save_favorite`, `list_favorites`, `remove_favorite`
-- Build `set_preferences`, `get_preferences`
+- Build `set_preferences`, `get_preferences` — preferences include an optional `email` field (used in Phase 5.5)
 - Build `get_recommendations` (uses preferences + Ticketmaster)
 - Add a resource that exposes the favorites list
 - **Goal:** Server remembers the user across sessions
@@ -105,6 +118,20 @@ Covered: MCP primitives, JSON-RPC, transports, tool-calling loop, security minds
 - Mock QR code generation
 - Seat holds with expiry
 - **Goal:** Full conversational booking flow end-to-end
+
+### Phase 5.5 — Post-Booking Notifications
+After `confirm_booking` succeeds, the server fires off two side effects:
+- **Email confirmation via Resend**
+  - HTML body summarizing event details, ticket count, total, mock QR
+  - `.ics` calendar file attached (works with Google, Apple, Outlook)
+  - Recipient pulled from preferences (`email` field set in Phase 4)
+  - Uses `onboarding@resend.dev` sender for dev — no domain verification needed
+- **Add-to-Google-Calendar deep link**
+  - Server builds `https://calendar.google.com/calendar/r/eventedit?...` URL with prefilled event data
+  - Returned in the `confirm_booking` response so user/Claude can present it as a clickable link
+  - Zero auth — just URL construction
+- **Privacy:** the user's email is never logged. It flows preferences → Resend payload → Resend's servers, and that's it.
+- **Goal:** Cover side-effect coordination (success → notify) without OAuth complexity. Real Google Calendar API + OAuth is deferred to Phase 6.5 if/when we add auth generally.
 
 ### Phase 6 — HTTP Transport & Deployment
 - Convert stdio → Streamable HTTP
@@ -159,6 +186,11 @@ events-mcp-server/
 │       │   ├── discovery.py  # search_events, etc.
 │       │   ├── favorites.py  # Phase 4
 │       │   └── booking.py    # Phase 5
+│       ├── prompts/          # Phase 3.5 — MCP Prompts
+│       │   └── discovery.py  # event_night_plan, genre_picks, compare_events, surprise_me
+│       ├── notifications/    # Phase 5.5
+│       │   ├── email.py      # Resend integration
+│       │   └── calendar.py   # .ics builder + add-to-calendar URL
 │       ├── models/           # Pydantic models
 │       │   ├── events.py
 │       │   └── cart.py
@@ -234,7 +266,7 @@ Even though we haven't committed to auth, make these choices in earlier phases s
 
 ## 🎬 Where We Are Right Now
 
-**Status:** Phases 0 ✅, 1 ✅, 2 ✅, and 3 ✅ complete. Moving into Phase 4.
+**Status:** Phases 0 ✅, 1 ✅, 2 ✅, and 3 ✅ complete. Moving into Phase 3.5.
 
 **Phase 1 outcome:**
 - Project initialized with `uv` (`pyproject.toml`, `uv.lock`, `.venv`)
@@ -269,6 +301,6 @@ Even though we haven't committed to auth, make these choices in earlier phases s
 - Log calls use `lower_snake_case` past-tense event names (`tool_completed`, `cache_hit`, `ticketmaster_request`). Never log `merged_params` — only `user_params`.
 - Anything new that needs visibility gets a structured log call, not a `print()`.
 
-**Next immediate step (Phase 4):** Add `tinydb` for local persistence. Build `save_favorite`, `list_favorites`, `remove_favorite`, `set_preferences`, `get_preferences`, `get_recommendations`. Expose favorites as an MCP Resource. All storage namespaced under a `user_id` (hardcoded `"default_user"` for now, per forward-compat design).
+**Next immediate step (Phase 3.5):** Add four MCP **Prompts** (`event_night_plan`, `genre_picks`, `compare_events`, `surprise_me`) and a `sort` parameter on the three search tools. New `src/events_mcp/prompts/` module. After this, Phase 4 (favorites + persistence with `email` in preferences) and then Phase 5 (booking) and Phase 5.5 (Resend email + .ics calendar attachment + add-to-Google-Calendar deep link).
 
 **Reference doc:** See `LEARNINGS.md` for an indexed reference of every concept covered so far and what's planned ahead.
