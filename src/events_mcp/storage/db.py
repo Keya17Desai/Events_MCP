@@ -42,3 +42,7 @@ def favorites_table() -> Table:
 
 def preferences_table() -> Table:
     return _db.table("preferences")
+
+
+def carts_table() -> Table:
+    return _db.table("carts")
