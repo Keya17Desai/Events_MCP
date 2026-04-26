@@ -118,7 +118,6 @@ async def search_events(
                 "Order results by this dimension. Default: 'relevance,desc' "
                 "if a keyword is given, otherwise 'date,asc'."
             ),
-            strict=True,
         ),
     ] = None,
 ) -> SearchEventsResult:
@@ -218,10 +217,7 @@ async def search_venues(
     ] = 0,
     sort: Annotated[
         VenueSort | None,
-        Field(
-            description="Order results by this dimension. Default: relevance.",
-            strict=True,
-        ),
+        Field(description="Order results by this dimension. Default: relevance."),
     ] = None,
 ) -> SearchVenuesResult:
     """Search for venues (concert halls, stadiums, theaters).
@@ -287,10 +283,7 @@ async def search_attractions(
     ] = 0,
     sort: Annotated[
         AttractionSort | None,
-        Field(
-            description="Order results by this dimension. Default: relevance.",
-            strict=True,
-        ),
+        Field(description="Order results by this dimension. Default: relevance."),
     ] = None,
 ) -> SearchAttractionsResult:
     """Search for attractions: artists, teams, or performers.

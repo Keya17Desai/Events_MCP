@@ -16,6 +16,14 @@ from events_mcp.tools.discovery import (
     search_events,
     search_venues,
 )
+from events_mcp.tools.favorites import (
+    get_preferences,
+    get_recommendations,
+    list_favorites,
+    remove_favorite,
+    save_favorite,
+    set_preferences,
+)
 
 mcp = FastMCP(
     "Events MCP",
@@ -41,6 +49,20 @@ mcp.tool()(search_events)
 mcp.tool()(get_event_details)
 mcp.tool()(search_venues)
 mcp.tool()(search_attractions)
+
+mcp.tool()(save_favorite)
+mcp.tool()(list_favorites)
+mcp.tool()(remove_favorite)
+mcp.tool()(set_preferences)
+mcp.tool()(get_preferences)
+mcp.tool()(get_recommendations)
+
+
+@mcp.resource("events://favorites")
+def favorites_resource() -> str:
+    """JSON list of all events the user has saved as favorites."""
+    return list_favorites().model_dump_json(indent=2)
+
 
 mcp.prompt()(event_night_plan)
 mcp.prompt()(genre_picks)
