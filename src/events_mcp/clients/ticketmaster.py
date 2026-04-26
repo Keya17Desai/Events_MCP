@@ -22,11 +22,13 @@ DEFAULT_TIMEOUT_SECONDS = 10.0
 
 log = get_logger(__name__)
 
-# Ticketmaster's documented limit is 5 req/sec. We cap at 4/sec to leave
-# headroom for retries and clock skew. Module-level so it's shared across
-# every TicketmasterClient instance — putting it on the instance would let
-# concurrent tool calls each get their own 4/sec budget.
-_RATE_LIMITER = AsyncLimiter(max_rate=4, time_period=1)
+# Ticketmaster's documented "5 req/sec" actually enforces burst=1: requests
+# must be evenly spaced, not crammed into the same 200ms. AsyncLimiter(1, 0.3)
+# means "1 acquire per 300ms" — capacity 1 (no burst), sustained ~3.3/sec.
+# Comfortably under 5/sec and avoids the 429 spike-arrest. Module-level so
+# it's shared across every TicketmasterClient instance — putting it on the
+# instance would let concurrent tool calls each get their own budget.
+_RATE_LIMITER = AsyncLimiter(max_rate=1, time_period=0.3)
 
 # Two TTL caches, both module-level for the same shared-singleton reason as
 # the limiter. Searches change slowly (new events get added, prices shift) →

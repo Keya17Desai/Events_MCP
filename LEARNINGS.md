@@ -435,7 +435,23 @@ We currently spin up a new `TicketmasterClient` per tool call. If the limiter li
 
 #### Rate limiter ≠ throughput limiter
 
-Smoke test: 8 concurrent search calls took 2.24s wall time. Naïve math says "4/sec → should take 2 seconds for 8 calls", which is roughly right. But it's worth understanding *why*: the limiter governs **acquire time**, not response time. Each individual request still takes ~1.4s of network latency. The limiter just delays when each one is allowed to start.
+The limiter governs **acquire time**, not response time. Each individual request still takes ~1-2s of network latency. The limiter just delays when each one is allowed to start.
+
+#### ⚠️ Gotcha: "5/sec" is not the real shape
+
+We hit this live. Our first try was `AsyncLimiter(4, 1)` — capacity 4, leak rate 4/sec. That allows **4 requests to fire as a burst** at the start of every window. Ticketmaster responded with a 429:
+
+```
+Allowed rate : MessageRate{messagesPerPeriod=5,
+                periodInMicroseconds=1000000,
+                maxBurstMessageCount=1.0}
+```
+
+`maxBurstMessageCount=1.0` is the punchline. Ticketmaster's spike arrest enforces "5/sec with burst=1" — requests must be **evenly spaced at ~200ms intervals**, not packed into the same instant even if the per-second total stays under 5.
+
+Fix: `AsyncLimiter(max_rate=1, time_period=0.3)` — capacity 1 (no burst possible), one slot every 300ms = ~3.3/sec sustained. Comfortably under 5/sec, no spike-arrest violations.
+
+**Lesson:** when an API document says "N/sec", check whether the server enforces it as a sliding-window burst (allows packed bursts up to N) or a leaky-bucket smooth-rate (forces even spacing). They behave differently under load. Read the *response body* of a real 429 — Ticketmaster's was very explicit about its spike-arrest config, and that's what told us the real shape.
 
 ---
 
