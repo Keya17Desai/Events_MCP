@@ -512,6 +512,98 @@ Tool inputs are the LLM-facing boundary — they're the place where bad data ent
 
 ---
 
+## Phase 3.5 — MCP Surface Polish & Sorting
+
+### MCP Prompts — server-side reusable templates
+
+So far we'd only used **Tools** (functions the LLM picks). Prompts are a separate MCP primitive: **the user invokes them directly** in the AI client, usually as slash commands (`/event_night_plan`). The user fills in arguments via the client UI; the server returns prompt text; the LLM then executes that text — calling our tools as it goes.
+
+Mental model:
+
+```
+User types /event_night_plan        ← user-driven, not LLM-driven
+    → Client asks: "city? date? budget?"
+    → User fills in
+    → Server's event_night_plan(city, date, budget) returns a string
+    → That string becomes the prompt the LLM sees
+    → LLM runs the prompt, calling search_events along the way
+```
+
+Tools = **AI's verbs**. Prompts = **user's shortcuts**.
+
+### How they look in code
+
+```python
+@mcp.prompt()
+def event_night_plan(
+    city: Annotated[str, Field(description="City name", strict=True)],
+    date: Annotated[str, Field(description="Date (YYYY-MM-DD)", strict=True)],
+    budget: Annotated[str, Field(strict=True)] = "any",
+) -> str:
+    return f"Plan an evening of events in {city} on {date}..."
+```
+
+Same `Annotated[T, Field(...)]` convention as tools. The function returns the prompt body; FastMCP handles the protocol-level message envelope.
+
+#### Why prompts are *just text generators*
+
+The function does **no I/O**. It does not call tools. It does not fetch data. It just renders prompt text. The actual work happens when the LLM executes the returned text and (in our case) calls `search_events`, `get_event_details`, etc.
+
+This is a clean separation:
+- **Prompt logic** = how to phrase the task to the LLM (text formatting only)
+- **Tool logic** = the actual work (HTTP calls, data transforms)
+
+Smoke test: `scripts/smoke_test_prompts.py` calls each prompt function with sample args and prints the rendered string. No network involved — prompts are pure functions.
+
+### What we built (4 prompts)
+
+| Slash command | Args | What the LLM does |
+|---|---|---|
+| `/event_night_plan` | city, date, budget? | Searches for events on that date, filters by budget, picks 3, formats as itinerary |
+| `/genre_picks` | genre, city | Finds 5 events for a genre fan optimizing for variety, dates, price spread |
+| `/compare_events` | event_id_a, event_id_b | Fetches both, builds a side-by-side comparison table, recommends |
+| `/surprise_me` | city | Searches widely, deliberately skips obvious headliners, pitches one off-the-beaten-path event |
+
+Each lives in `src/events_mcp/prompts/discovery.py` and is registered in `server.py` via `mcp.prompt()(...)`.
+
+---
+
+### `Literal[...]` types for enum-like inputs
+
+Pydantic and `typing.Literal` are best friends for enumerated values. Where strings would be lenient, `Literal["a", "b", "c"]` rejects anything outside the listed values:
+
+```python
+EventSort = Literal[
+    "name,asc", "name,desc",
+    "date,asc", "date,desc",
+    "relevance,asc", "relevance,desc",
+    "random",
+    "onSaleStartDate,asc", "onSaleStartDate,desc",
+    "venueName,asc", "venueName,desc",
+]
+
+sort: Annotated[EventSort | None, Field(strict=True)] = None
+```
+
+Three benefits:
+1. **The LLM's tool schema lists exactly the allowed values** — so it doesn't have to guess.
+2. **Pydantic validates it** automatically — no manual `if sort not in {...}` check.
+3. **Your IDE autocompletes them** — no typos.
+
+#### Why three different sort literals
+
+Ticketmaster's sort field accepts a different subset per endpoint: events allow `date`/`venueName`/`onSaleStartDate`, venues don't. We typed each search tool with its own `EventSort` / `VenueSort` / `AttractionSort` literal so the schema only advertises what actually works on that endpoint.
+
+#### What we deliberately omitted: `distance,asc`
+
+The API supports `distance,asc`, but only when paired with a `latlong` parameter. Calling it without latlong returns 400. Until we expose latlong (probably when we add geolocation in a later phase), we keep `distance,asc` out of the literal — the strict-typed schema can't list a broken option as valid.
+
+### Cache + sort interaction (already correct)
+
+Cache key is `(path, sorted(params.items()))`. The `sort` value is just another key in `params`, so `sort=date,asc` and `sort=date,desc` produce distinct cache entries automatically. We confirmed this in the smoke test — both calls logged `cache_miss`. No code change to caching needed.
+
+---
+
 ## Phase 4 — User State & Persistence (upcoming)
 
 | Concept | What it is |

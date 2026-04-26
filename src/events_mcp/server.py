@@ -4,6 +4,12 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from events_mcp.logging import configure_logging, get_logger
+from events_mcp.prompts.discovery import (
+    compare_events,
+    event_night_plan,
+    genre_picks,
+    surprise_me,
+)
 from events_mcp.tools.discovery import (
     get_event_details,
     search_attractions,
@@ -35,6 +41,11 @@ mcp.tool()(search_events)
 mcp.tool()(get_event_details)
 mcp.tool()(search_venues)
 mcp.tool()(search_attractions)
+
+mcp.prompt()(event_night_plan)
+mcp.prompt()(genre_picks)
+mcp.prompt()(compare_events)
+mcp.prompt()(surprise_me)
 
 
 def main() -> None:

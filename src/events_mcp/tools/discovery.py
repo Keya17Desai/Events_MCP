@@ -1,7 +1,7 @@
 """Discovery tools — search and fetch live events from Ticketmaster."""
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
@@ -13,6 +13,40 @@ from events_mcp.models.events import EventDetail, EventSummary, SearchEventsResu
 from events_mcp.models.venues import SearchVenuesResult, VenueSummary
 
 log = get_logger(__name__)
+
+# Sort values per Ticketmaster Discovery API. Each endpoint accepts a
+# different subset, so we type them separately. We deliberately omit
+# 'distance,asc' until we add latlong support — calling it without a
+# latlong param triggers a 400.
+EventSort = Literal[
+    "name,asc",
+    "name,desc",
+    "date,asc",
+    "date,desc",
+    "relevance,asc",
+    "relevance,desc",
+    "random",
+    "onSaleStartDate,asc",
+    "onSaleStartDate,desc",
+    "venueName,asc",
+    "venueName,desc",
+]
+
+VenueSort = Literal[
+    "name,asc",
+    "name,desc",
+    "relevance,asc",
+    "relevance,desc",
+    "random",
+]
+
+AttractionSort = Literal[
+    "name,asc",
+    "name,desc",
+    "relevance,asc",
+    "relevance,desc",
+    "random",
+]
 
 
 async def search_events(
@@ -77,6 +111,16 @@ async def search_events(
             strict=True,
         ),
     ] = 0,
+    sort: Annotated[
+        EventSort | None,
+        Field(
+            description=(
+                "Order results by this dimension. Default: 'relevance,desc' "
+                "if a keyword is given, otherwise 'date,asc'."
+            ),
+            strict=True,
+        ),
+    ] = None,
 ) -> SearchEventsResult:
     """Search live events on Ticketmaster.
 
@@ -97,6 +141,8 @@ async def search_events(
         api_params["startDateTime"] = start_date_time
     if end_date_time:
         api_params["endDateTime"] = end_date_time
+    if sort:
+        api_params["sort"] = sort
 
     settings = get_settings()
     async with TicketmasterClient(settings.ticketmaster_api_key) as client:
@@ -170,6 +216,13 @@ async def search_venues(
         int,
         Field(description="Zero-indexed page number", ge=0, strict=True),
     ] = 0,
+    sort: Annotated[
+        VenueSort | None,
+        Field(
+            description="Order results by this dimension. Default: relevance.",
+            strict=True,
+        ),
+    ] = None,
 ) -> SearchVenuesResult:
     """Search for venues (concert halls, stadiums, theaters).
 
@@ -183,6 +236,8 @@ async def search_venues(
         api_params["city"] = city
     if country_code:
         api_params["countryCode"] = country_code
+    if sort:
+        api_params["sort"] = sort
 
     settings = get_settings()
     async with TicketmasterClient(settings.ticketmaster_api_key) as client:
@@ -230,6 +285,13 @@ async def search_attractions(
         int,
         Field(description="Zero-indexed page number", ge=0, strict=True),
     ] = 0,
+    sort: Annotated[
+        AttractionSort | None,
+        Field(
+            description="Order results by this dimension. Default: relevance.",
+            strict=True,
+        ),
+    ] = None,
 ) -> SearchAttractionsResult:
     """Search for attractions: artists, teams, or performers.
 
@@ -241,6 +303,8 @@ async def search_attractions(
         api_params["keyword"] = keyword
     if classification:
         api_params["classificationName"] = classification
+    if sort:
+        api_params["sort"] = sort
 
     settings = get_settings()
     async with TicketmasterClient(settings.ticketmaster_api_key) as client:

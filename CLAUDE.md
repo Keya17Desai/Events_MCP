@@ -266,7 +266,7 @@ Even though we haven't committed to auth, make these choices in earlier phases s
 
 ## 🎬 Where We Are Right Now
 
-**Status:** Phases 0 ✅, 1 ✅, 2 ✅, and 3 ✅ complete. Moving into Phase 3.5.
+**Status:** Phases 0 ✅, 1 ✅, 2 ✅, 3 ✅, and 3.5 ✅ complete. Moving into Phase 4.
 
 **Phase 1 outcome:**
 - Project initialized with `uv` (`pyproject.toml`, `uv.lock`, `.venv`)
@@ -301,6 +301,16 @@ Even though we haven't committed to auth, make these choices in earlier phases s
 - Log calls use `lower_snake_case` past-tense event names (`tool_completed`, `cache_hit`, `ticketmaster_request`). Never log `merged_params` — only `user_params`.
 - Anything new that needs visibility gets a structured log call, not a `print()`.
 
-**Next immediate step (Phase 3.5):** Add four MCP **Prompts** (`event_night_plan`, `genre_picks`, `compare_events`, `surprise_me`) and a `sort` parameter on the three search tools. New `src/events_mcp/prompts/` module. After this, Phase 4 (favorites + persistence with `email` in preferences) and then Phase 5 (booking) and Phase 5.5 (Resend email + .ics calendar attachment + add-to-Google-Calendar deep link).
+**Phase 3.5 outcome:**
+- Four MCP **Prompts** in `src/events_mcp/prompts/discovery.py`: `event_night_plan`, `genre_picks`, `compare_events`, `surprise_me`
+- `sort` parameter on `search_events` / `search_venues` / `search_attractions`, typed as a `Literal[...]` per endpoint (each accepts a different subset)
+- `distance,asc` deliberately omitted until we add a `latlong` parameter — strict typing won't expose a broken option
+- Smoke tests added: `smoke_test_prompts.py`, `smoke_test_sort.py`
+
+**Conventions established in Phase 3.5 (apply going forward):**
+- MCP **Prompts** are pure text generators — no I/O, no tool calls. They just render the string the LLM will execute. All real work happens inside the tools the prompt tells the LLM to call.
+- Enum-like inputs use `Literal[...]` types, not free strings — Pydantic + Literal gives the LLM a fixed allowed set in the tool schema and enforces it without manual checks.
+
+**Next immediate step (Phase 4):** Add `tinydb` for local persistence. Build `save_favorite`, `list_favorites`, `remove_favorite`, `set_preferences` (including optional `email` field for Phase 5.5), `get_preferences`, `get_recommendations`. Expose favorites as an MCP Resource. All storage namespaced under a `user_id` (hardcoded `"default_user"` for now).
 
 **Reference doc:** See `LEARNINGS.md` for an indexed reference of every concept covered so far and what's planned ahead.
