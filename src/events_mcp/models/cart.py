@@ -47,6 +47,32 @@ class CartItem(BaseModel):
     )
 
 
+class PaymentQuote(BaseModel):
+    """Summary returned by generate_payment_link.
+
+    Wraps the cart's payment link with a precomputed total so the LLM
+    doesn't have to sum line items itself. has_unpriced_items is set
+    when any item came back from Ticketmaster without a price; those
+    items contribute 0 to the total and the LLM should warn the user.
+    """
+
+    cart_id: str
+    payment_link: str = Field(..., description="Mock payment URL — not real")
+    total: float = Field(..., ge=0)
+    currency: str | None = Field(
+        None,
+        description="Currency of the total; null if all items were unpriced",
+    )
+    has_unpriced_items: bool = Field(
+        ...,
+        description="True if any line item had no price (sum is partial)",
+    )
+    expires_at: str | None = Field(
+        None,
+        description="When the underlying seat hold expires",
+    )
+
+
 class Cart(BaseModel):
     """A booking cart. One open cart per user at a time."""
 

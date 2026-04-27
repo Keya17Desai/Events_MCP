@@ -1,8 +1,8 @@
 """Smoke test: Phase 5 — booking flow.
 
 Grows commit by commit. Right now: create_cart, get_cart, add_to_cart
-(including merge-on-duplicate behavior), and reserve_seats (with hold
-expiry).
+(including merge-on-duplicate behavior), reserve_seats (with hold
+expiry), and generate_payment_link (idempotent + cleared on lapse).
 
 The test wipes the user's carts at the start so it's safely re-runnable.
 We use the storage table directly for cleanup since Phase 5 deliberately
@@ -24,6 +24,7 @@ from events_mcp.storage.db import DEFAULT_USER_ID, carts_table
 from events_mcp.tools.booking import (
     add_to_cart,
     create_cart,
+    generate_payment_link,
     get_cart,
     reserve_seats,
 )
@@ -140,6 +141,49 @@ async def main() -> None:
     assert cart.state == CartState.ITEMS_ADDED
     assert cart.items[0].quantity == 4
     print(f"OK: qty now {cart.items[0].quantity}")
+
+    _section("13. generate_payment_link before reserve — should fail")
+    try:
+        generate_payment_link()
+    except ValueError as e:
+        print(f"OK: rejected with — {e}")
+    else:
+        raise AssertionError("expected ValueError generating link before reserve")
+
+    _section("14. generate_payment_link after reserve — should succeed")
+    reserve_seats()
+    quote = generate_payment_link()
+    assert quote.cart_id == cart.cart_id
+    assert quote.payment_link.endswith(cart.cart_id)
+    expected_total = sum(
+        (i.unit_price or 0) * i.quantity for i in cart.items
+    )
+    assert quote.total == expected_total, (quote.total, expected_total)
+    print(
+        f"OK: link={quote.payment_link}  total={quote.total} {quote.currency}  "
+        f"has_unpriced={quote.has_unpriced_items}"
+    )
+
+    _section("15. generate_payment_link again — idempotent (same link)")
+    quote2 = generate_payment_link()
+    assert quote2.payment_link == quote.payment_link
+    print("OK: same payment_link returned")
+
+    _section("16. lapse clears payment_link; re-reserve regenerates")
+    table = carts_table()
+    C = Query()
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    table.update({"expires_at": past}, C.cart_id == quote.cart_id)
+    demoted = get_cart()
+    assert demoted.state == CartState.ITEMS_ADDED
+    assert demoted.payment_link is None, "lapse should clear payment_link"
+    print("OK: lapse cleared payment_link")
+    reserve_seats()
+    quote3 = generate_payment_link()
+    # Link is deterministic on cart_id, so the URL itself is unchanged.
+    # The point is the server *did* regenerate it (was None mid-flow).
+    assert quote3.payment_link == quote.payment_link
+    print("OK: re-reservation regenerated the (deterministic) link")
 
 
 if __name__ == "__main__":

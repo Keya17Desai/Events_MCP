@@ -17,7 +17,7 @@ from pydantic import Field
 from tinydb import Query
 
 from events_mcp.logging import get_logger
-from events_mcp.models.cart import Cart, CartItem, CartState
+from events_mcp.models.cart import Cart, CartItem, CartState, PaymentQuote
 from events_mcp.storage.db import DEFAULT_USER_ID, carts_table
 from events_mcp.tools.discovery import get_event_details
 
@@ -25,6 +25,7 @@ log = get_logger(__name__)
 
 MAX_QUANTITY_PER_EVENT = 10
 HOLD_MINUTES = 10
+PAYMENT_LINK_BASE = "https://payments.events-mcp.local/pay"
 
 
 def _now_iso() -> str:
@@ -46,6 +47,7 @@ def _apply_expiry(cart: Cart) -> Cart:
 
     cart.state = CartState.ITEMS_ADDED
     cart.expires_at = None
+    cart.payment_link = None
     cart.updated_at = _now_iso()
     _save_cart(cart)
     log.info(
@@ -262,3 +264,73 @@ def reserve_seats() -> Cart:
         items_count=len(cart.items),
     )
     return cart
+
+
+def _compute_total(items: list[CartItem]) -> tuple[float, str | None, bool]:
+    """Return (total, currency, has_unpriced_items) for a list of items.
+
+    Unpriced items contribute 0 to the total. Currency is the first
+    non-null currency we see; mixed-currency carts are not supported
+    and are not enforced here (Ticketmaster events each have their own).
+    """
+    total = 0.0
+    currency: str | None = None
+    has_unpriced = False
+    for item in items:
+        if item.unit_price is None:
+            has_unpriced = True
+            continue
+        total += item.unit_price * item.quantity
+        if currency is None:
+            currency = item.currency
+    return total, currency, has_unpriced
+
+
+def generate_payment_link() -> PaymentQuote:
+    """Generate a mock payment link for the user's RESERVED cart.
+
+    The cart must already be RESERVED — call reserve_seats first. The
+    link is a fake URL (the events-mcp.local domain doesn't resolve);
+    it stands in for a real PSP redirect so we can demo the flow
+    without a payment provider.
+
+    Idempotent: calling twice on the same RESERVED cart returns the
+    same link. If the hold lapsed and the cart was demoted, a later
+    re-reservation gets a fresh link (lapse clears payment_link).
+
+    Items with no price contribute 0 to the total, and has_unpriced_items
+    is set so the LLM can warn the user before they "pay".
+    """
+    cart = _require_open_cart()
+
+    if cart.state != CartState.RESERVED:
+        raise ValueError(
+            f"Cannot generate payment link: cart is in state "
+            f"'{cart.state.value}'. Call reserve_seats first."
+        )
+
+    if cart.payment_link is None:
+        cart.payment_link = f"{PAYMENT_LINK_BASE}/{cart.cart_id}"
+        cart.updated_at = _now_iso()
+        _save_cart(cart)
+        log.info(
+            "payment_link_generated",
+            user_id=DEFAULT_USER_ID,
+            cart_id=cart.cart_id,
+        )
+    else:
+        log.info(
+            "payment_link_returned_existing",
+            user_id=DEFAULT_USER_ID,
+            cart_id=cart.cart_id,
+        )
+
+    total, currency, has_unpriced = _compute_total(cart.items)
+    return PaymentQuote(
+        cart_id=cart.cart_id,
+        payment_link=cart.payment_link,
+        total=total,
+        currency=currency,
+        has_unpriced_items=has_unpriced,
+        expires_at=cart.expires_at,
+    )
