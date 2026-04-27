@@ -10,6 +10,7 @@ dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.27.0",
     "python-dotenv>=1.2.2",
+    "qrcode[pil]>=8.2",
     "structlog>=25.5.0",
     "tinydb>=4.8.2",
 ]

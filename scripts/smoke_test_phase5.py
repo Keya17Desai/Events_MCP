@@ -1,8 +1,8 @@
 """Smoke test: Phase 5 — booking flow.
 
-Grows commit by commit. Right now: create_cart, get_cart, add_to_cart
-(including merge-on-duplicate behavior), reserve_seats (with hold
-expiry), and generate_payment_link (idempotent + cleared on lapse).
+Covers the full booking state machine: create → add → reserve →
+generate_payment_link → confirm_booking, plus error/edge paths
+(empty reserve, hold lapse, missing payment link, etc.).
 
 The test wipes the user's carts at the start so it's safely re-runnable.
 We use the storage table directly for cleanup since Phase 5 deliberately
@@ -23,6 +23,7 @@ from events_mcp.models.cart import CartState
 from events_mcp.storage.db import DEFAULT_USER_ID, carts_table
 from events_mcp.tools.booking import (
     add_to_cart,
+    confirm_booking,
     create_cart,
     generate_payment_link,
     get_cart,
@@ -184,6 +185,42 @@ async def main() -> None:
     # The point is the server *did* regenerate it (was None mid-flow).
     assert quote3.payment_link == quote.payment_link
     print("OK: re-reservation regenerated the (deterministic) link")
+
+    _section("17. confirm_booking — success path")
+    confirmed = confirm_booking()
+    assert confirmed.state == CartState.CONFIRMED
+    assert confirmed.booking_id is not None
+    assert confirmed.paid_at is not None
+    assert confirmed.confirmed_at is not None
+    assert confirmed.qr_data_uri is not None
+    assert confirmed.qr_data_uri.startswith("data:image/png;base64,")
+    assert confirmed.expires_at is None, "expires_at should be cleared on CONFIRMED"
+    print(
+        f"OK: state={confirmed.state}  booking_id={confirmed.booking_id}  "
+        f"qr_bytes_b64_len={len(confirmed.qr_data_uri)}"
+    )
+
+    _section("18. after CONFIRMED, no open cart — get_cart should raise")
+    try:
+        get_cart()
+    except ValueError as e:
+        print(f"OK: rejected with — {e}")
+    else:
+        raise AssertionError("expected ValueError reading after confirm")
+
+    _section("19. confirm_booking with no payment_link — should fail")
+    # Fresh cart, reserve, then null out the payment_link, then confirm.
+    _wipe_user_carts()
+    create_cart()
+    await add_to_cart(event_id=event.id, quantity=1)
+    reserved2 = reserve_seats()
+    table.update({"payment_link": None}, C.cart_id == reserved2.cart_id)
+    try:
+        confirm_booking()
+    except ValueError as e:
+        print(f"OK: rejected with — {e}")
+    else:
+        raise AssertionError("expected ValueError confirming without payment_link")
 
 
 if __name__ == "__main__":

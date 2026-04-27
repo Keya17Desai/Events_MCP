@@ -9,10 +9,13 @@ real auth plugs in here in Phase 6.5 without a schema migration).
 """
 from __future__ import annotations
 
+import base64
+import io
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
+import qrcode
 from pydantic import Field
 from tinydb import Query
 
@@ -334,3 +337,60 @@ def generate_payment_link() -> PaymentQuote:
         has_unpriced_items=has_unpriced,
         expires_at=cart.expires_at,
     )
+
+
+def _make_qr_data_uri(payload: str) -> str:
+    """Encode payload as a PNG QR code, return as a data: URI."""
+    img = qrcode.make(payload)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+def confirm_booking() -> Cart:
+    """Finalize the booking. RESERVED → CONFIRMED.
+
+    Requires a payment_link (i.e. generate_payment_link must have been
+    called first) — this stands in for "the user clicked the link and
+    paid". Stamps booking_id, paid_at, confirmed_at, and a real QR
+    PNG (as a data: URI) encoding the booking reference for venue
+    entry. Clears expires_at since the seat hold no longer applies.
+
+    Once confirmed, the cart is no longer "open" — a subsequent
+    create_cart will start a fresh one.
+    """
+    cart = _require_open_cart()
+
+    if cart.state != CartState.RESERVED:
+        raise ValueError(
+            f"Cannot confirm: cart is in state '{cart.state.value}'. "
+            f"Call reserve_seats first."
+        )
+
+    if cart.payment_link is None:
+        raise ValueError(
+            "Cannot confirm: no payment link on cart. "
+            "Call generate_payment_link first."
+        )
+
+    now = _now_iso()
+    booking_id = str(uuid.uuid4())
+    cart.state = CartState.CONFIRMED
+    cart.booking_id = booking_id
+    cart.paid_at = now
+    cart.confirmed_at = now
+    cart.qr_data_uri = _make_qr_data_uri(f"events-mcp:booking/{booking_id}")
+    cart.expires_at = None
+    cart.updated_at = now
+    _save_cart(cart)
+
+    log.info(
+        "booking_confirmed",
+        user_id=DEFAULT_USER_ID,
+        cart_id=cart.cart_id,
+        booking_id=booking_id,
+        items_count=len(cart.items),
+    )
+    # Phase 5.5 seam: email + calendar side effects fire here.
+    return cart

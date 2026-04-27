@@ -18,6 +18,7 @@ from events_mcp.tools.discovery import (
 )
 from events_mcp.tools.booking import (
     add_to_cart,
+    confirm_booking,
     create_cart,
     generate_payment_link,
     get_cart,
@@ -69,6 +70,7 @@ mcp.tool()(add_to_cart)
 mcp.tool()(get_cart)
 mcp.tool()(reserve_seats)
 mcp.tool()(generate_payment_link)
+mcp.tool()(confirm_booking)
 
 
 @mcp.resource("events://favorites")
