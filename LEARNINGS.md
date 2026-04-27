@@ -604,13 +604,148 @@ Cache key is `(path, sorted(params.items()))`. The `sort` value is just another 
 
 ---
 
-## Phase 4 — User State & Persistence (upcoming)
+## Phase 4 — User State & Persistence
 
-| Concept | What it is |
-|---|---|
-| `tinydb` | Lightweight document database stored as a JSON file. No SQL, no server needed. Good for Phase 4; we'll graduate to SQLite later. |
-| MCP Resources | A way to expose read-only data (like a favorites list) that Claude can read without calling a tool. Identified by a URI like `events://favorites`. |
-| `user_id` namespacing | All stored data is keyed under a `user_id` (hardcoded to `"default_user"` for now) to make multi-user support easy to add later. |
+### `tinydb` — a JSON-file document store
+
+`tinydb` is a single-file document database. No server, no SQL, no schema migrations — every record is a Python dict, persisted as JSON. We open it once at module load:
+
+```python
+_db = TinyDB(DB_PATH, indent=2)
+
+def favorites_table()   -> Table: return _db.table("favorites")
+def preferences_table() -> Table: return _db.table("preferences")
+def carts_table()       -> Table: return _db.table("carts")
+```
+
+A "table" in tinydb is just a named collection inside the same JSON file. We have three: `favorites`, `preferences`, and `carts` (Phase 5). All in `data/db.json`.
+
+**Why this and not SQLite (yet)?** TinyDB's wire format is a JSON file you can `cat` and read. For a learning project where the data model is still moving, that's a feature. The cost is that there are no indexes — every query scans the table — but at our scale (a handful of records per user), scan cost is invisible. We'll graduate to SQLite when querying gets real.
+
+#### Tinydb query DSL
+
+```python
+from tinydb import Query
+Fav = Query()
+table.search((Fav.user_id == DEFAULT_USER_ID) & (Fav.id == event_id))
+```
+
+`Query()` returns a builder object whose attribute access produces field-comparison expressions. `&` and `|` combine them. The expressions are evaluated against each row of the table in turn — no execution plan, no joins, just Python.
+
+#### `EVENTS_MCP_DB_PATH` env override
+
+`storage/db.py` checks `os.environ["EVENTS_MCP_DB_PATH"]` before falling back to the project default. Useful for tests that want a throwaway DB without touching the real one. The hook is in place; we haven't needed it yet because smoke tests just wipe their own slice of the table.
+
+---
+
+### `user_id` namespacing — forward-compat for auth
+
+Every record we store includes a `user_id` field. All reads filter by it:
+
+```python
+table.search(Fav.user_id == DEFAULT_USER_ID)
+```
+
+Right now `DEFAULT_USER_ID = "default_user"` — a single hardcoded constant. The shape is what matters. When Phase 6.5 adds OIDC, the only change is "where does `user_id` come from at the call site" — the storage layer, models, and tools don't have to learn about auth. CLAUDE.md flagged this design choice up front; this phase is where it pays off.
+
+Concrete consequences:
+- Storage helpers like `favorites_table()` return the **whole table** — they don't pre-filter. The user filter is the caller's responsibility, because the caller is the one who knows whose data it is.
+- We never write a "global" record without a `user_id`. Even `Preferences(user_id=DEFAULT_USER_ID)` for the empty/never-set case carries the namespace.
+
+---
+
+### Snapshot pattern (favorites edition)
+
+Same idea as the cart's `event_name` / `unit_price` snapshotting in Phase 5: when `save_favorite` runs, it fetches the event details once and **freezes** the relevant fields onto the `Favorite` record. `list_favorites` later just reads that JSON — no API call, no quota burn, and the displayed fields can't drift.
+
+The model itself just extends `EventSummary` with the extra metadata fields:
+
+```python
+class Favorite(EventSummary):
+    user_id: str
+    saved_at: str
+```
+
+Subclassing keeps the favorite shape identical to a search result + two metadata fields, so an LLM that's seen one knows how to read the other.
+
+---
+
+### Idempotent constructor pattern (again)
+
+`save_favorite` checks for an existing record before writing — saving the same event twice returns the existing favorite, doesn't error, doesn't duplicate. Same shape as `create_cart` in Phase 5: **constructors that name a thing the user wants are idempotent on the existence of that thing.** It's how we avoid making the LLM keep state about whether it already called the tool.
+
+---
+
+### Sparse upsert — `None` means "leave alone", empty means "clear"
+
+`set_preferences` takes every field as `Optional`, defaulting to `None`:
+
+```python
+def set_preferences(
+    email: str | None = None,
+    preferred_city: str | None = None,
+    preferred_genres: list[str] | None = None,
+    currency: str | None = None,
+) -> Preferences: ...
+```
+
+Two semantics on the same `None` would be ambiguous, so we documented the convention: **`None` means "don't touch this field"; empty string / empty list means "clear this field".** The implementation only writes fields whose argument is non-None, so a single call can update one field without resetting the others.
+
+This matches how a user actually interacts conversationally: "set my email to X" should not silently wipe their preferred genres. A schema where every call is a full replacement would force the LLM to re-pass values it never changed — a footgun.
+
+---
+
+### PII handling — log the event, never the value
+
+`email` is the first piece of real PII we store. The convention we set:
+
+```python
+log.info(
+    "preferences_updated",
+    user_id=DEFAULT_USER_ID,
+    fields_changed=fields_changed,  # ← list of field NAMES, not values
+)
+```
+
+`fields_changed` is `["email", "currency"]`, never `{"email": "k@example.com"}`. The log line records *that* email was set, never *what* email. Same rule applies to anything PII-shaped going forward. We get this habit in now so adding more user data later doesn't require a logging audit. (CLAUDE.md "Forward-Compatible Design Choices, item 4".)
+
+Field descriptions also flag the rule for the LLM, e.g. `"Email for booking confirmations. Never logged."` That description is part of the tool schema the LLM sees.
+
+---
+
+### MCP Resources — read-only data without a tool call
+
+Tools are **AI-driven verbs** (the LLM calls them). Resources are **read-only nouns** the client can fetch directly via a URI:
+
+```python
+@mcp.resource("events://favorites")
+def favorites_resource() -> str:
+    """JSON list of all events the user has saved as favorites."""
+    return list_favorites().model_dump_json(indent=2)
+```
+
+The URI scheme `events://` is ours — MCP lets servers define their own. A client can list resources, fetch `events://favorites`, and present the JSON to the user (or to the LLM) without invoking a tool round-trip.
+
+**Why expose favorites this way as well as via `list_favorites`?** Same data, different consumption pattern. A tool call is a verb-shaped interaction ("get me my favorites"). A resource is a noun-shaped one ("here, look at this list of favorites") — useful when a UI wants to render the data, or when a prompt wants to attach it as context without forcing the LLM to make a call.
+
+---
+
+### Recommendations — preferences-driven search, transparent ranking
+
+`get_recommendations` is **not** ML. It takes the user's stored `preferred_city` and the first item of `preferred_genres`, builds a filtered `search_events` call, and returns the result sorted by date:
+
+```python
+search_kwargs = {"size": size, "sort": "date,asc"}
+if prefs.preferred_city:    search_kwargs["city"] = prefs.preferred_city
+if prefs.preferred_genres:  search_kwargs["classification"] = prefs.preferred_genres[0]
+
+result = await search_events(**search_kwargs)
+return RecommendationsResult(events=result.events, based_on=based_on)
+```
+
+The result includes a `based_on` dict naming the filters that were applied. That's deliberate: the CLAUDE.md ethics rule says **"Recommendation transparency — if we sort/filter events, document the ranking logic."** The LLM can read `based_on` and tell the user *"these are based on your preferred city Mumbai and your interest in concerts"* — no black box.
+
+If no preferences are set, we return an empty `events` list and an empty `based_on` instead of doing a generic fallback search. Better to say "I have no basis to recommend" than to invent one and pretend it's tailored.
 
 ---
 
