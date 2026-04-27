@@ -614,13 +614,104 @@ Cache key is `(path, sorted(params.items()))`. The `sort` value is just another 
 
 ---
 
-## Phase 5 — Simulated Booking Flow (upcoming)
+## Phase 5 — Simulated Booking Flow
 
-| Concept | What it is |
-|---|---|
-| State machine | A pattern where an object (the cart) moves through defined states: `created → items_added → reserved → paid → confirmed`. Invalid transitions are rejected. |
-| Seat hold with expiry | A reservation that auto-expires after N minutes if not confirmed. Prevents indefinite holds. |
-| Mock QR code | A generated string/image that represents a "ticket" — no real ticketing system involved. |
+### The Cart finite state machine
+
+A `Cart` moves through five states, in order:
+
+```
+CREATED → ITEMS_ADDED → RESERVED → PAID → CONFIRMED
+```
+
+States are `StrEnum` values (`CartState.CREATED`, etc.) on a single Pydantic `Cart` model — not a discriminated union. We picked the single-model shape because (a) the FSM is small, (b) most fields are shared across states, and (c) Pydantic discriminated unions add ceremony that doesn't pay off until you have very different shapes per state.
+
+**Transitions are enforced at the tool boundary, not in the type system.** Each booking tool checks `cart.state` against the set of allowed source states for that operation, raises `ValueError` if the transition is invalid, and writes the new state to TinyDB. The model itself permits any state value at any time — defense lives in the tool layer.
+
+```python
+if cart.state not in {CartState.CREATED, CartState.ITEMS_ADDED}:
+    raise ValueError(f"Cannot add items: cart is in state '{cart.state.value}'.")
+```
+
+### One-open-cart-per-user — idempotent constructors
+
+`create_cart` returns the user's existing open cart (anything not `CONFIRMED`) instead of erroring or creating a duplicate. Same shape as `reserve_seats` and `generate_payment_link`: each constructor is **idempotent on its own state** — call it twice on a cart already in that state and you get the same record back. This makes the conversational LLM flow forgiving — "did I already start a cart?" never has to be answered, just call `create_cart` again.
+
+### The snapshot pattern (price stability)
+
+When `add_to_cart` runs, it calls `get_event_details(event_id)` and **copies** `event_name`, `unit_price`, and `currency` onto the `CartItem`:
+
+```python
+cart.items.append(CartItem(
+    event_id=event_id,
+    event_name=detail.name,
+    quantity=quantity,
+    unit_price=detail.price_min,
+    currency=detail.price_currency,
+))
+```
+
+If Ticketmaster updates the event's price 30 seconds later, the cart still reflects what the user agreed to. This is the same pattern real e-commerce uses — line items hold their own price; they never re-fetch at checkout. Without it, someone could "lock in" a price by adding to cart, then have the total silently change on them at payment.
+
+### Merge-on-duplicate-add
+
+Adding the same `event_id` twice doesn't create two line items — it sums the quantity into the existing one, capped at 10 per event. Cleaner cart UX than letting an LLM accidentally produce ten one-ticket lines for the same event.
+
+### Seat-hold simulation — purely local
+
+Real ticket platforms back reservations with seat-level locks in their inventory system. Ticketmaster has **no public hold endpoint**, so `reserve_seats` is a pure local state-machine operation: stamp `state = RESERVED`, set `expires_at = now + HOLD_MINUTES`, save. No HTTP call. We named the simulation honestly in code comments rather than pretending we're holding anything externally.
+
+### Lazy expiry vs background sweep
+
+A held reservation can lapse. Two ways to detect it:
+- **Background sweep:** a periodic task scans for expired carts and demotes them.
+- **Lazy on read:** every `_find_open_cart` call checks `expires_at` against `now()` and demotes if past.
+
+We picked **lazy**. Reasons: (1) no background tasks, no asyncio scheduling, no concurrency edge cases; (2) the only thing that matters is that the next *operation* sees a coherent state; (3) for a single-user simulation, we will never observe a stale RESERVED cart in practice. The trade-off is that a never-read expired cart sits in the DB stale until someone touches it — fine for our scale.
+
+When the demotion fires, we revert to `ITEMS_ADDED` (items survive — user can re-reserve) and clear `expires_at` and `payment_link`. Clearing the payment link matters because the link semantically referenced the now-lapsed hold.
+
+### Mock payment URL — deterministically fake
+
+`generate_payment_link` produces `https://payments.events-mcp.local/pay/{cart_id}`. The `.local` TLD doesn't resolve, the path is just the cart id, and the URL is **not** clickable to anything real. Two upsides:
+
+1. **Deterministic by design** — same cart, same URL. Idempotency falls out for free; we just check `if cart.payment_link is None`.
+2. **No PSP simulation drift** — we're not mocking what Stripe would do; we're explicitly *not* hitting Stripe. The fake-ness is part of the contract, not a stand-in for something.
+
+The tool returns a `PaymentQuote` (separate from `Cart`) with `total`, `currency`, and a `has_unpriced_items: bool`. The flag matters because Ticketmaster events sometimes return without prices — we sum what we can and surface the gap rather than silently producing `total=0`.
+
+### Manual confirmation, not auto-charge
+
+`confirm_booking` requires `payment_link` to already be present on the cart. Generating the link does **not** advance the state or imply payment. The user is meant to click the link "externally" (in our sim, just acknowledge it exists) and then call `confirm_booking`. This enforces the CLAUDE.md ethics rule: *"Manual payment confirmation — never auto-charge, always generate a link and let user confirm."*
+
+The `PAID` state exists in the enum but is never observable through tool calls. `confirm_booking` collapses `RESERVED → PAID → CONFIRMED` into one atomic write. We kept `PAID` as a model value anyway — costs nothing, and a future "two-step confirm" flow could split it out without a schema change.
+
+### QR code generation — `qrcode[pil]`
+
+The QR is the **entry ticket**, generated at `confirm_booking` time and returned as `qr_data_uri`. It is *not* the payment QR — that's `payment_link`. Two completely different things in the flow:
+
+| Stage | Field | Form | Purpose |
+|---|---|---|---|
+| Payment | `payment_link` | URL string | User clicks → "pays" externally |
+| Entry | `qr_data_uri` | data: URI (PNG) | Venue staff scan it at the gate |
+
+We use the `qrcode` library (with the `[pil]` extra to pull in Pillow for PNG output):
+
+```python
+img = qrcode.make("events-mcp:booking/{booking_id}")
+buf = io.BytesIO()
+img.save(buf, format="PNG")
+b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+return f"data:image/png;base64,{b64}"
+```
+
+The encoded payload is `events-mcp:booking/{booking_id}` — a self-describing opaque reference, **not** a URL. A phone scanner shows it as text. A real venue's scanner would look up the booking_id in their system. This keeps the QR honest about what it is: a reference, not a clickable link.
+
+The `data:` URI lets any MCP client render the image inline without a separate file fetch — important because MCP clients aren't necessarily browsers.
+
+### The Phase 5.5 seam
+
+`confirm_booking` ends with a comment `# Phase 5.5 seam: email + calendar side effects fire here.` That's deliberate. Side effects (Resend email, Google Calendar deep link) hook onto the success branch *after* persistence — never before. If the email send fails, the booking is still saved. We don't want to roll back a confirmed booking because a notification provider had a bad afternoon.
 
 ---
 
