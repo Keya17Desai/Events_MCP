@@ -21,6 +21,7 @@ from tinydb import Query
 from events_mcp.logging import configure_logging
 from events_mcp.models.cart import CartState
 from events_mcp.storage.db import DEFAULT_USER_ID, carts_table
+from events_mcp.notifications.calendar import build_google_calendar_url
 from events_mcp.tools.booking import (
     add_to_cart,
     confirm_booking,
@@ -187,7 +188,8 @@ async def main() -> None:
     print("OK: re-reservation regenerated the (deterministic) link")
 
     _section("17. confirm_booking — success path")
-    confirmed = confirm_booking()
+    result = await confirm_booking()
+    confirmed = result.cart
     assert confirmed.state == CartState.CONFIRMED
     assert confirmed.booking_id is not None
     assert confirmed.paid_at is not None
@@ -200,6 +202,16 @@ async def main() -> None:
         f"qr_bytes_b64_len={len(confirmed.qr_data_uri)}"
     )
 
+    _section("17a. calendar_links — populated or skipped per event date availability")
+    print(f"calendar_links count: {len(result.calendar_links)}")
+    for link in result.calendar_links:
+        assert link.url.startswith(
+            "https://calendar.google.com/calendar/r/eventedit?"
+        )
+        print(f"  - {link.event_name}: {link.url[:80]}...")
+    if not result.calendar_links:
+        print("  (none — event had no start_date; valid skip path)")
+
     _section("18. after CONFIRMED, no open cart — get_cart should raise")
     try:
         get_cart()
@@ -207,6 +219,40 @@ async def main() -> None:
         print(f"OK: rejected with — {e}")
     else:
         raise AssertionError("expected ValueError reading after confirm")
+
+    _section("18a. build_google_calendar_url — all three branches")
+    timed = build_google_calendar_url(
+        title="Hawks at Knicks GM3",
+        start_date="2026-04-15",
+        start_time="19:30:00",
+        timezone="America/New_York",
+        location="Madison Square Garden, New York",
+        details="test",
+    )
+    assert timed is not None
+    assert "dates=20260415T193000%2F20260415T223000" in timed
+    assert "ctz=America%2FNew_York" in timed
+    print(f"OK timed:  {timed[:90]}...")
+
+    all_day = build_google_calendar_url(
+        title="Museum Exhibit",
+        start_date="2026-05-01",
+        start_time=None,
+        timezone=None,
+    )
+    assert all_day is not None
+    assert "dates=20260501%2F20260502" in all_day
+    assert "ctz=" not in all_day, "all-day events should not include ctz"
+    print(f"OK all-day: {all_day[:90]}...")
+
+    missing = build_google_calendar_url(
+        title="No Date Event",
+        start_date=None,
+        start_time=None,
+        timezone=None,
+    )
+    assert missing is None
+    print("OK missing-date returns None (caller should skip)")
 
     _section("19. confirm_booking with no payment_link — should fail")
     # Fresh cart, reserve, then null out the payment_link, then confirm.
@@ -216,7 +262,7 @@ async def main() -> None:
     reserved2 = reserve_seats()
     table.update({"payment_link": None}, C.cart_id == reserved2.cart_id)
     try:
-        confirm_booking()
+        await confirm_booking()
     except ValueError as e:
         print(f"OK: rejected with — {e}")
     else:

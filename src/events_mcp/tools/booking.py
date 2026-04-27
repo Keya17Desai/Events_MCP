@@ -19,8 +19,17 @@ import qrcode
 from pydantic import Field
 from tinydb import Query
 
+from events_mcp.clients.ticketmaster import TicketmasterAPIError
 from events_mcp.logging import get_logger
-from events_mcp.models.cart import Cart, CartItem, CartState, PaymentQuote
+from events_mcp.models.cart import (
+    BookingConfirmation,
+    CalendarLink,
+    Cart,
+    CartItem,
+    CartState,
+    PaymentQuote,
+)
+from events_mcp.notifications.calendar import build_google_calendar_url
 from events_mcp.storage.db import DEFAULT_USER_ID, carts_table
 from events_mcp.tools.discovery import get_event_details
 
@@ -348,7 +357,7 @@ def _make_qr_data_uri(payload: str) -> str:
     return f"data:image/png;base64,{b64}"
 
 
-def confirm_booking() -> Cart:
+async def confirm_booking() -> BookingConfirmation:
     """Finalize the booking. RESERVED → CONFIRMED.
 
     Requires a payment_link (i.e. generate_payment_link must have been
@@ -356,6 +365,15 @@ def confirm_booking() -> Cart:
     paid". Stamps booking_id, paid_at, confirmed_at, and a real QR
     PNG (as a data: URI) encoding the booking reference for venue
     entry. Clears expires_at since the seat hold no longer applies.
+
+    Returns a BookingConfirmation wrapping the saved cart and any
+    side-effect outputs — currently a list of Google Calendar deep
+    links (one per unique event in the cart) so the user can add the
+    event(s) to their own calendar with one click.
+
+    Side-effect failures (e.g. calendar lookup) do NOT roll back the
+    booking — the cart stays CONFIRMED and the relevant link is just
+    omitted with a logged reason.
 
     Once confirmed, the cart is no longer "open" — a subsequent
     create_cart will start a fresh one.
@@ -392,5 +410,74 @@ def confirm_booking() -> Cart:
         booking_id=booking_id,
         items_count=len(cart.items),
     )
-    # Phase 5.5 seam: email + calendar side effects fire here.
-    return cart
+
+    calendar_links = await _build_calendar_links(cart, booking_id)
+    return BookingConfirmation(cart=cart, calendar_links=calendar_links)
+
+
+async def _build_calendar_links(
+    cart: Cart, booking_id: str
+) -> list[CalendarLink]:
+    """Build one Google Calendar deep link per unique event in the cart.
+
+    Skips events whose details we can't fetch (logged) or that have no
+    start_date (logged). Never raises — notification failures must not
+    roll back a saved booking.
+    """
+    links: list[CalendarLink] = []
+    seen: set[str] = set()
+    for item in cart.items:
+        if item.event_id in seen:
+            continue
+        seen.add(item.event_id)
+
+        try:
+            detail = await get_event_details(item.event_id)
+        except TicketmasterAPIError:
+            log.warning(
+                "calendar_link_lookup_failed",
+                user_id=DEFAULT_USER_ID,
+                event_id=item.event_id,
+            )
+            continue
+
+        location_parts = [p for p in (detail.venue_name, detail.city) if p]
+        location = ", ".join(location_parts) if location_parts else None
+        details_text = (
+            f"Booking {booking_id} via Events MCP. "
+            f"Tickets: {item.quantity}."
+        )
+
+        url = build_google_calendar_url(
+            title=detail.name,
+            start_date=detail.start_date,
+            start_time=detail.start_time,
+            timezone=detail.timezone,
+            location=location,
+            details=details_text,
+        )
+
+        if url is None:
+            log.info(
+                "calendar_link_skipped",
+                user_id=DEFAULT_USER_ID,
+                event_id=item.event_id,
+                reason="no_start_date",
+            )
+            continue
+
+        links.append(
+            CalendarLink(
+                event_id=item.event_id,
+                event_name=item.event_name,
+                url=url,
+            )
+        )
+
+    log.info(
+        "calendar_links_built",
+        user_id=DEFAULT_USER_ID,
+        cart_id=cart.cart_id,
+        link_count=len(links),
+    )
+    return links

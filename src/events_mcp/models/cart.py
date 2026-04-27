@@ -47,6 +47,29 @@ class CartItem(BaseModel):
     )
 
 
+class CalendarLink(BaseModel):
+    """One Google Calendar deep link, scoped to a single event in a booking."""
+
+    event_id: str
+    event_name: str
+    url: str = Field(..., description="Google Calendar 'add event' deep link")
+
+
+class BookingConfirmation(BaseModel):
+    """Response from confirm_booking — wraps the saved cart with side effects.
+
+    Notification fields fill in across Phase 5.5 commits:
+    - calendar_links: populated in commit 1/3
+    - email_sent / email_skipped_reason: commit 3/3
+    """
+
+    cart: Cart
+    calendar_links: list[CalendarLink] = Field(
+        default_factory=list,
+        description="One Google Calendar add-event link per unique event in the cart",
+    )
+
+
 class PaymentQuote(BaseModel):
     """Summary returned by generate_payment_link.
 

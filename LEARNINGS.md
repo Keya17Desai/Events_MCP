@@ -850,6 +850,94 @@ The `data:` URI lets any MCP client render the image inline without a separate f
 
 ---
 
+## Phase 5.5 — Post-Booking Notifications
+
+### Side effects vs the core flow
+
+`confirm_booking` does two kinds of work in a defined order:
+
+1. **Core flow** — finalize the cart and persist (`state = CONFIRMED`, save).
+2. **Side effects** — Google Calendar deep links, and (commit 3/3) the Resend email.
+
+Side effects run **after** persistence. If a calendar lookup or email send fails, the booking is already saved — we log the failure and continue. The user still gets their confirmed cart back; just one of the "extras" is missing. This is the correct shape for any system that does notifications: never roll back the *real* work because a notification provider had a bad afternoon.
+
+```python
+_save_cart(cart)                 # core — must succeed
+log.info("booking_confirmed", ...)
+
+calendar_links = await _build_calendar_links(cart, booking_id)  # side effect
+return BookingConfirmation(cart=cart, calendar_links=calendar_links)
+```
+
+### Google Calendar deep-link — pure URL construction, no auth
+
+A Google Calendar "add event" link is just:
+
+```
+https://calendar.google.com/calendar/r/eventedit?text=...&dates=...&ctz=...&location=...&details=...
+```
+
+When the user clicks it, Google opens a pre-filled event-creation form on *their* calendar. No OAuth, no API call, no service account — just a string. We build it with `urllib.parse.urlencode` and return it.
+
+**Why we picked this over the real Google Calendar API:** the real API requires OAuth 2.0 with the user's Google account, which means a consent flow and refresh-token storage. That's a Phase 6.5-shaped problem. The deep link gets us 90% of the UX with 5% of the code.
+
+### Three branches of date handling
+
+Ticketmaster's `dates.start` shape gives us three cases:
+
+| Has `start_date` | Has `start_time` | Branch | Google `dates` format |
+|---|---|---|---|
+| ✅ | ✅ | Timed event | `YYYYMMDDTHHMMSS/YYYYMMDDTHHMMSS` + `ctz=<tz>` |
+| ✅ | ❌ | All-day event | `YYYYMMDD/YYYYMMDD` (no `ctz`) |
+| ❌ | — | Skip — return `None` | (caller skips this event) |
+
+Two design choices worth flagging:
+
+1. **`ctz` instead of UTC conversion.** Google accepts either `YYYYMMDDTHHMMSSZ` (UTC) or `YYYYMMDDTHHMMSS` + `ctz=America/New_York`. We use the second form. Reason: Ticketmaster gives us the local time and an IANA timezone. Doing the conversion to UTC ourselves means handling DST edge cases and weird timezones (Newfoundland, Lord Howe). Punting on it via `ctz` lets Google handle TZ math correctly.
+
+2. **All-day event end is the *next day*.** Google's all-day format is `YYYYMMDD/YYYYMMDD` and the end day is *exclusive* — for a single-day all-day event, end = start + 1 day. Surprising at first; documented in the function's docstring so future-me doesn't try to "fix" it.
+
+### Re-fetch vs snapshot at add-time (the trade-off we made)
+
+`CartItem` snapshots `event_name`, `unit_price`, `currency` — but **not** the date or venue. So `_build_calendar_links` calls `get_event_details(item.event_id)` per unique event in the cart at confirmation time.
+
+Trade-off:
+- **Re-fetch (chosen):** simpler model, no new fields on `CartItem`. The `get_event_details` cache (15-min TTL from Phase 3) means the call almost always hits cache for an event the user just added — effectively free.
+- **Snapshot at add-time:** no extra calls at confirm time, but `CartItem` grows (date, venue, city, timezone, ...) and we'd be storing data that could go stale.
+
+For a learning project at our scale the re-fetch is the right shape. If we ever scale to many bookings or want carts to survive without the API being available, snapshotting becomes the right answer.
+
+### `BookingConfirmation` — wrapping the cart with side-effect outputs
+
+`confirm_booking` previously returned `Cart`. With notifications joining the picture, the response shape needs to carry both the saved cart *and* the side-effect outputs. New model:
+
+```python
+class BookingConfirmation(BaseModel):
+    cart: Cart
+    calendar_links: list[CalendarLink]
+    # email_sent / email_skipped_reason land in commit 3/3
+```
+
+**Why a wrapper rather than adding fields to `Cart`?** `Cart` is the persisted shape — what's in TinyDB. Notification outputs are response-only data; they're computed at confirmation time and never need to be re-read. Mixing them onto the storage model would mean either persisting them (waste) or making them transient on a stored model (confusing). Cleaner to keep `Cart` storage-shaped and let `BookingConfirmation` be the response shape.
+
+### Logging side-effect failures
+
+Three new structured-log events introduced this commit:
+
+- `calendar_links_built` — fires once per confirm, with `link_count`. Useful for "did anything generate?"
+- `calendar_link_skipped` — fires per skipped event, with `reason="no_start_date"`. The reason field is a closed set so log queries can filter cleanly.
+- `calendar_link_lookup_failed` — fires per event whose `get_event_details` raised. We don't include the exception message (it might contain API URL fragments); we log just `event_id` and the user can match it up.
+
+Same `lower_snake_case` past-tense convention as the rest of the codebase.
+
+### What we deliberately didn't do this commit
+
+- **No timezone math.** `ctz` punts it to Google. If Google ever drops `ctz` we'll have to convert.
+- **No retries on `get_event_details` failure.** One try, log, skip. The booking is already saved; retrying is the user's call (re-confirm doesn't make sense — confirmation isn't idempotent for new links). A "regenerate calendar links for booking X" tool could be added later if needed.
+- **No multi-currency support in the calendar `details` text.** We pass `Tickets: {qty}` but not the price/currency, because the calendar details field is meant to be human prose and prices were already shown at payment-link time.
+
+---
+
 ## Phase 6 — HTTP Transport & Deployment (upcoming)
 
 | Concept | What it is |
