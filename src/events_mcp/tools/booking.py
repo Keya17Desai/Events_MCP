@@ -10,7 +10,7 @@ real auth plugs in here in Phase 6.5 without a schema migration).
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from pydantic import Field
@@ -24,14 +24,44 @@ from events_mcp.tools.discovery import get_event_details
 log = get_logger(__name__)
 
 MAX_QUANTITY_PER_EVENT = 10
+HOLD_MINUTES = 10
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _apply_expiry(cart: Cart) -> Cart:
+    """Lazily demote an expired RESERVED cart back to ITEMS_ADDED.
+
+    Persists the demotion if it happens. No-op for any other state or
+    for a still-valid hold.
+    """
+    if cart.state != CartState.RESERVED or cart.expires_at is None:
+        return cart
+
+    expires = datetime.fromisoformat(cart.expires_at)
+    if datetime.now(timezone.utc) < expires:
+        return cart
+
+    cart.state = CartState.ITEMS_ADDED
+    cart.expires_at = None
+    cart.updated_at = _now_iso()
+    _save_cart(cart)
+    log.info(
+        "cart_reservation_expired",
+        user_id=DEFAULT_USER_ID,
+        cart_id=cart.cart_id,
+    )
+    return cart
+
+
 def _find_open_cart() -> Cart | None:
-    """Return the user's open (non-CONFIRMED) cart, or None if no cart is open."""
+    """Return the user's open (non-CONFIRMED) cart, or None if no cart is open.
+
+    Lazy-demotes a RESERVED cart whose hold has lapsed back to ITEMS_ADDED
+    before returning, so every caller sees a coherent state.
+    """
     table = carts_table()
     C = Query()
     rows = table.search(
@@ -39,7 +69,7 @@ def _find_open_cart() -> Cart | None:
     )
     if not rows:
         return None
-    return Cart.model_validate(rows[0])
+    return _apply_expiry(Cart.model_validate(rows[0]))
 
 
 def _require_open_cart() -> Cart:
@@ -187,6 +217,48 @@ async def add_to_cart(
         event_id=event_id,
         quantity=quantity,
         merged=merged,
+        items_count=len(cart.items),
+    )
+    return cart
+
+
+def reserve_seats() -> Cart:
+    """Promote the user's open cart from ITEMS_ADDED to RESERVED.
+
+    Stamps an expires_at timestamp HOLD_MINUTES into the future. While
+    RESERVED, the cart cannot be modified — calling reserve_seats again
+    refreshes the hold (idempotent extend). If the hold lapses, the
+    cart auto-reverts to ITEMS_ADDED on the next read so the user can
+    retry without losing items.
+
+    Real ticket platforms back this with seat-level locks; ours is a
+    pure local state machine — no Ticketmaster call.
+    """
+    cart = _require_open_cart()
+
+    if cart.state in {CartState.PAID, CartState.CONFIRMED}:
+        raise ValueError(
+            f"Cannot reserve: cart is in state '{cart.state.value}'."
+        )
+
+    if not cart.items:
+        raise ValueError(
+            "Cannot reserve an empty cart. Add at least one item first."
+        )
+
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=HOLD_MINUTES)
+    cart.state = CartState.RESERVED
+    cart.expires_at = expires.isoformat()
+    cart.updated_at = now.isoformat()
+    _save_cart(cart)
+
+    log.info(
+        "cart_reserved",
+        user_id=DEFAULT_USER_ID,
+        cart_id=cart.cart_id,
+        expires_at=cart.expires_at,
+        hold_minutes=HOLD_MINUTES,
         items_count=len(cart.items),
     )
     return cart
