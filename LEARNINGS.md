@@ -857,7 +857,7 @@ The `data:` URI lets any MCP client render the image inline without a separate f
 `confirm_booking` does two kinds of work in a defined order:
 
 1. **Core flow** — finalize the cart and persist (`state = CONFIRMED`, save).
-2. **Side effects** — Google Calendar deep links, and (commit 3/3) the Resend email.
+2. **Side effects** — Google Calendar deep links **and** the Resend email confirmation (with `.ics` attached).
 
 Side effects run **after** persistence. If a calendar lookup or email send fails, the booking is already saved — we log the failure and continue. The user still gets their confirmed cart back; just one of the "extras" is missing. This is the correct shape for any system that does notifications: never roll back the *real* work because a notification provider had a bad afternoon.
 
@@ -865,8 +865,17 @@ Side effects run **after** persistence. If a calendar lookup or email send fails
 _save_cart(cart)                 # core — must succeed
 log.info("booking_confirmed", ...)
 
-calendar_links = await _build_calendar_links(cart, booking_id)  # side effect
-return BookingConfirmation(cart=cart, calendar_links=calendar_links)
+# Side effects — failures captured, never raised.
+event_details_by_id = await _fetch_unique_event_details(cart)
+calendar_links = _build_calendar_links(cart, booking_id, event_details_by_id)
+email_sent, email_skipped_reason = await send_booking_confirmation(...)
+
+return BookingConfirmation(
+    cart=cart,
+    calendar_links=calendar_links,
+    email_sent=email_sent,
+    email_skipped_reason=email_skipped_reason,
+)
 ```
 
 ### Google Calendar deep-link — pure URL construction, no auth
@@ -897,6 +906,89 @@ Two design choices worth flagging:
 
 2. **All-day event end is the *next day*.** Google's all-day format is `YYYYMMDD/YYYYMMDD` and the end day is *exclusive* — for a single-day all-day event, end = start + 1 day. Surprising at first; documented in the function's docstring so future-me doesn't try to "fix" it.
 
+### `.ics` / iCalendar (RFC 5545) — the standard import format
+
+The Google Calendar deep link is a one-click win for users on Google. But Apple Calendar, Outlook, and Fastmail don't follow that URL convention — they need a **file**. That's `.ics`: a plain UTF-8 text file in the iCalendar format (RFC 5545). Every desktop / mobile / web calendar app understands it.
+
+A minimal `.ics` looks like:
+
+```
+BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+SUMMARY:Coldplay — Music of the Spheres
+DTSTART:20260515T233000Z
+DTEND:20260516T023000Z
+LOCATION:Madison Square Garden\, New York
+UID:booking-abc:event-1@events-mcp
+END:VEVENT
+END:VCALENDAR
+```
+
+Things that are spec-mandated but easy to get wrong:
+
+- **CRLF line endings** (`\r\n`), not `\n`. Many parsers tolerate `\n`, some don't.
+- **Comma escaping** in text fields — `"Madison Square Garden, NY"` becomes `"Madison Square Garden\, NY"`. Same for `;` and `\`.
+- **`UID`** must be globally unique and stable. We use `"<booking_id>:<event_id>@events-mcp"` so re-imports update the existing event in the user's calendar instead of creating a duplicate.
+- **All-day events** use `DTSTART;VALUE=DATE:20260501` — the `VALUE=DATE` parameter swaps the type from datetime to date.
+- **Timed events** with timezones either inline a `VTIMEZONE` block or render in UTC with the `Z` suffix. We do the latter — convert to UTC in Python, append `Z`, done.
+
+We hand all of that to the `ics` library so we don't write a single escape rule ourselves.
+
+### The `ics` library — composing VEVENT blocks without hand-rolling RFC 5545
+
+`ics` (PyPI: [`ics`](https://pypi.org/project/ics/), v0.7.x) gives us two classes:
+
+```python
+from ics import Calendar, Event
+
+cal = Calendar()
+e = Event()
+e.name = "Coldplay — Music of the Spheres"
+e.uid = "booking-abc:event-1@events-mcp"
+e.begin = datetime(2026, 5, 15, 19, 30, tzinfo=ZoneInfo("America/New_York"))
+e.end = e.begin + timedelta(hours=3)
+e.location = "Madison Square Garden, New York"
+cal.events.add(e)
+
+ics_text = cal.serialize()  # → str
+```
+
+A few things worth noting:
+
+- **`begin` / `end` accept tz-aware datetimes** and serialize to UTC automatically (so `19:30 EDT` becomes `DTSTART:20260515T233000Z`). The library does the math we'd otherwise do with `astimezone(timezone.utc)`.
+- **`make_all_day()`** flips an event to the `VALUE=DATE` form. Pass a date string to `begin` and call this method.
+- **`str(cal)` is deprecated** in favor of `cal.serialize()` — `ics` raises a `FutureWarning` on `str(cal)`. Use the explicit method.
+- **`begin` / `end` accept naive datetimes too** — but the library treats them as UTC silently, which is a footgun. Always pass tz-aware datetimes (we use `ZoneInfo` from stdlib).
+
+`build_ics_text` is a **pure function** — takes a list of `ICSEventInput` dataclasses, returns the serialized text. No I/O, no Cart awareness, no preferences lookup. The caller composes the inputs from the cart and event details. Keeps the renderer trivially testable and reusable.
+
+### Sharing the event-details fetch across side effects
+
+Once we had two side effects that both need the per-event details (Google Calendar links **and** the email body / `.ics`), the Phase 5.5 commit-1 shape became wasteful:
+
+```python
+calendar_links = await _build_calendar_links(cart, booking_id)
+# ↑ this internally calls get_event_details for every unique event
+email = await send_booking_confirmation(cart, booking_id, ...)
+# ↑ this would also need to call get_event_details for the same events
+```
+
+Even with the 15-min detail cache making repeat calls "free", the two helpers fetching independently meant duplicate code, two log entries per event, and an implicit dependency on the cache being warm. Refactor:
+
+```python
+event_details_by_id = await _fetch_unique_event_details(cart)
+calendar_links = _build_calendar_links(cart, booking_id, event_details_by_id)
+email = await send_booking_confirmation(cart, booking_id, event_details_by_id, ...)
+```
+
+Two side benefits fell out:
+
+- `_build_calendar_links` is now **pure / sync** — it no longer does any I/O, just composes URLs from a dict it's handed. Easier to reason about, easier to test.
+- The "fetch failed" log line (`event_detail_lookup_failed`) fires exactly once per event, regardless of how many side effects consume the result.
+
+Lesson: when two side effects read the same external data, lift the read out and pass the result down. The cache made the "duplicate read" technically harmless, but it was *organizationally* messier.
+
 ### Re-fetch vs snapshot at add-time (the trade-off we made)
 
 `CartItem` snapshots `event_name`, `unit_price`, `currency` — but **not** the date or venue. So `_build_calendar_links` calls `get_event_details(item.event_id)` per unique event in the cart at confirmation time.
@@ -909,32 +1001,161 @@ For a learning project at our scale the re-fetch is the right shape. If we ever 
 
 ### `BookingConfirmation` — wrapping the cart with side-effect outputs
 
-`confirm_booking` previously returned `Cart`. With notifications joining the picture, the response shape needs to carry both the saved cart *and* the side-effect outputs. New model:
+`confirm_booking` previously returned `Cart`. With notifications joining the picture, the response shape needs to carry both the saved cart *and* the side-effect outputs:
 
 ```python
 class BookingConfirmation(BaseModel):
     cart: Cart
-    calendar_links: list[CalendarLink]
-    # email_sent / email_skipped_reason land in commit 3/3
+    calendar_links: list[CalendarLink] = []
+    email_sent: bool = False
+    email_skipped_reason: str | None = None
 ```
 
 **Why a wrapper rather than adding fields to `Cart`?** `Cart` is the persisted shape — what's in TinyDB. Notification outputs are response-only data; they're computed at confirmation time and never need to be re-read. Mixing them onto the storage model would mean either persisting them (waste) or making them transient on a stored model (confusing). Cleaner to keep `Cart` storage-shaped and let `BookingConfirmation` be the response shape.
 
+**Why a `(bool, str | None)` shape instead of an enum or exception?** The two fields together encode three states: `(True, None)` = sent, `(False, "reason_str")` = skipped with explanation, `(False, None)` is unreachable (we always set a reason on skip). The string reason is a *closed set* (`resend_not_configured`, `no_email_in_preferences`, `resend_api_error`, `network_error`) but kept as `str` for forward-compat — adding a new reason doesn't require an enum migration. The LLM downstream sees the reason verbatim, which is more useful for natural-language relaying than an opaque enum value.
+
+### Resend — transactional email API in one POST
+
+[Resend](https://resend.com) is a transactional email service: you POST a JSON payload, their servers handle SPF/DKIM/MIME and deliver the message. Free tier is 100 emails/day, 3000/month — plenty for a learning project, and zero charge to fail-fast experiment.
+
+The wire format is one HTTP call:
+
+```
+POST https://api.resend.com/emails
+Authorization: Bearer re_xxx
+Content-Type: application/json
+
+{
+  "from": "Events MCP <onboarding@resend.dev>",
+  "to": ["user@example.com"],
+  "subject": "Your booking is confirmed",
+  "html": "<!doctype html>...",
+  "attachments": [{"filename": "booking.ics", "content": [...], "content_type": "text/calendar; charset=utf-8"}]
+}
+```
+
+We use the official `resend` Python SDK (a thin wrapper) instead of hand-rolling the call. Reason: the attachment encoding and the `SendParams` TypedDict take some of the friction away. We could equally well use `httpx` directly — the call is simple — but the SDK matched the shape of the rest of the project (typed params, named exception classes).
+
+### Sender domain verification — why `onboarding@resend.dev`
+
+Real email deliverability requires the sender's domain to publish DNS records (SPF, DKIM, DMARC) authorizing your provider to send on its behalf. If we tried `from: events@gmail.com`, Gmail's SPF check would see Resend's IPs, find no authorization in `gmail.com`'s DNS, and bounce the message.
+
+Resend solves the "I just want to test this" problem by owning a dev sandbox domain — `resend.dev` — that's pre-configured with the right DNS. You can send `from: onboarding@resend.dev` to any address tied to your Resend account without setting anything up.
+
+Caveats / what's actually allowed:
+
+- **Only `onboarding@resend.dev` is whitelisted** for the sandbox. You can't claim other addresses on `resend.dev` — that's Resend's owned domain.
+- **In free/dev mode you can only send to your own account email** until you verify a custom domain (so you can test without spamming strangers).
+- **Display name is configurable** — `"Events MCP <onboarding@resend.dev>"` shows as "Events MCP" in the inbox, hiding the slightly-weird local-part.
+
+Forward-compat: `RESEND_FROM` is a separate env var with that string as default. Swapping to `bookings@yourdomain.com` once a domain is verified is a one-line change.
+
+### Sync vs async SDK methods — when `asyncio.to_thread` isn't needed
+
+The Resend SDK exposes both sync and async variants for every operation — `Emails.send` and `Emails.send_async`. Same params, same response shape; the async one uses an internal `httpx` client instead of `requests`.
+
+This matters because `confirm_booking` is async. With a sync-only SDK we'd have two options:
+1. Call it from `asyncio.to_thread(...)` so the blocking I/O happens in a thread pool.
+2. Just call it sync and accept the brief event-loop block.
+
+Either works for ~100 emails/day, but the `send_async` variant lets us skip both — the SDK call is `await`able and integrates cleanly with our existing async stack:
+
+```python
+result = await resend.Emails.send_async(params)
+```
+
+Lesson: when picking a sync-by-default SDK, check for an `_async` variant before reaching for `to_thread`.
+
+### Attachment encoding — `list[int]` vs base64 string
+
+The `Attachment` TypedDict accepts `content` as either:
+- A `list[int]` — i.e. `list(b"file bytes")`, raw bytes as a list of integers.
+- A `str` — base64-encoded.
+
+Both end up base64-encoded on the wire (Resend's API requires it). The `list[int]` form is the one their docs lead with, and it's slightly nicer because we don't have to call `base64.b64encode` ourselves:
+
+```python
+ics_text = build_ics_text(...)
+attachment = {
+    "filename": "booking.ics",
+    "content": list(ics_text.encode("utf-8")),
+    "content_type": "text/calendar; charset=utf-8",
+}
+```
+
+**Why explicit `content_type`:** the SDK can derive it from the filename extension, but `.ics` isn't always recognized — and Apple Mail in particular renders the attachment quite differently if the MIME type is `text/plain` vs `text/calendar`. Set it explicitly.
+
+### Optional config + graceful skip
+
+`RESEND_API_KEY` is **optional** in our `Settings`. The whole booking flow has to keep working for someone running the server without an email provider configured (developers, CI, anyone exploring the booking sim).
+
+```python
+class Settings(BaseModel):
+    resend_api_key: str | None = Field(None, ...)
+    resend_from: str = Field(DEFAULT_RESEND_FROM, ...)
+```
+
+Two subtle bits:
+
+1. **Empty string in `.env` (`RESEND_API_KEY=`) is treated the same as unset.** `os.environ.get("RESEND_API_KEY") or None` coerces `""` → `None`. Without that, we'd accept the empty key as "configured" and Resend would 401.
+2. **The skip happens at the email module's entry, not in `confirm_booking`.** `send_booking_confirmation` checks `settings.resend_api_key` and `prefs.email` itself and returns `(False, "reason")`. The booking flow doesn't gate on either — it just collects the result and reports it back. That keeps the FSM clean and the email module fully responsible for its own preconditions.
+
+### HTML escaping — why every interpolation goes through `html.escape`
+
+Event names, venue names, city names, the booking ID — all of these flow into the email's HTML body. They came from Ticketmaster (which we treat as untrusted external data per CLAUDE.md's security rules), and the booking ID is server-generated UUID4 (so safe), but **uniform escaping is cheaper than reasoning about which fields are safe**.
+
+```python
+from html import escape as html_lib_escape  # stdlib, not jinja
+
+f'<div style="font-weight:600;">{html_lib.escape(item.event_name)}</div>'
+```
+
+What this prevents:
+
+- A Ticketmaster event titled `"Concert <script>alert(1)</script>"` becomes `"Concert &lt;script&gt;alert(1)&lt;/script&gt;"` — text, not executable JS. Most email clients sandbox JS anyway, but defense-in-depth.
+- An event with quotes in the venue name (`"Madison Square \"the world's most famous arena\""`) won't break out of an HTML attribute and inject styles.
+
+We'd reach for Jinja2 if the template grew much beyond what we have. For 100 lines of HTML composition, hand-rolled f-strings + `html.escape` is fine.
+
+### Privacy contract — what the email module logs (and doesn't)
+
+The module's docstring includes a privacy contract:
+
+> The recipient email value is NEVER written to logs. Logs reference `user_id` and `cart_id` / `booking_id` only.
+
+Concretely:
+
+- `prefs.email` appears in exactly two places: the `to:` field of the Resend payload, and a falsy check (`if not prefs.email`).
+- Failure logs include the **exception class name** and Resend's **status code** (useful for debugging) — never the address or the rendered HTML body.
+- The success log records Resend's returned message ID (`resend_id`) so an operator can trace a delivery in the Resend dashboard, but nothing PII-bearing.
+
+A single `grep "prefs.email\|to_email" notifications/email.py` confirms the address only flows into the API call, never into a log call. Worth running periodically as the module grows.
+
 ### Logging side-effect failures
 
-Three new structured-log events introduced this commit:
+Structured-log events introduced across the phase, all `lower_snake_case` past-tense per the project convention:
 
-- `calendar_links_built` — fires once per confirm, with `link_count`. Useful for "did anything generate?"
-- `calendar_link_skipped` — fires per skipped event, with `reason="no_start_date"`. The reason field is a closed set so log queries can filter cleanly.
-- `calendar_link_lookup_failed` — fires per event whose `get_event_details` raised. We don't include the exception message (it might contain API URL fragments); we log just `event_id` and the user can match it up.
+| Event | When | Notable fields |
+|---|---|---|
+| `calendar_links_built` | Once per confirm | `link_count` — "did anything generate?" |
+| `calendar_link_skipped` | Per skipped event | `reason="no_start_date"` (closed set so queries filter cleanly) |
+| `event_detail_lookup_failed` | Per event whose `get_event_details` raised | `event_id` only — no exception message (might contain API URL fragments) |
+| `email_skipped` | Once per confirm if email path bails out | `reason` — one of `resend_not_configured`, `no_email_in_preferences` |
+| `email_failed` | Once per confirm on Resend / network error | `reason`, `error_class`, `status_code` (when available) — never the address |
+| `email_sent` | On success | `booking_id`, `resend_id` (Resend's message ID for tracing) |
 
-Same `lower_snake_case` past-tense convention as the rest of the codebase.
+All side-effect log lines reference `user_id` and `cart_id` so they can be traced back to a booking without logging PII.
 
-### What we deliberately didn't do this commit
+### What we deliberately didn't do this phase
 
-- **No timezone math.** `ctz` punts it to Google. If Google ever drops `ctz` we'll have to convert.
+- **No timezone math for the Google deep link.** `ctz` punts it to Google. The `.ics` builder *does* convert to UTC (the `ics` library expects it) — different tools, different conventions.
 - **No retries on `get_event_details` failure.** One try, log, skip. The booking is already saved; retrying is the user's call (re-confirm doesn't make sense — confirmation isn't idempotent for new links). A "regenerate calendar links for booking X" tool could be added later if needed.
-- **No multi-currency support in the calendar `details` text.** We pass `Tickets: {qty}` but not the price/currency, because the calendar details field is meant to be human prose and prices were already shown at payment-link time.
+- **No multi-currency support in the calendar `details` text.** We pass `Tickets: {qty}` but not the price/currency, because the calendar `details` field is meant to be human prose and prices were already shown at payment-link time.
+- **No retries on Resend failure.** One attempt; surface `resend_api_error` / `network_error` and let the user retry by triggering a re-send tool we'll add later if needed. Auto-retry on transactional email is a footgun (duplicate messages on transient errors).
+- **No email body localization or templating engine.** F-strings + `html.escape` for now; revisit if the template grows or we need multi-language.
+- **No real Google Calendar API or Outlook write-back.** Both require OAuth — deferred to Phase 6.5 (auth) if/when we add it.
+- **The `.ics` is attached to email but not surfaced in `BookingConfirmation`.** Decision was: email is the only delivery channel for the file. Easy to surface separately later if a non-email integration ever needs it.
 
 ---
 
