@@ -58,15 +58,27 @@ class CalendarLink(BaseModel):
 class BookingConfirmation(BaseModel):
     """Response from confirm_booking — wraps the saved cart with side effects.
 
-    Notification fields fill in across Phase 5.5 commits:
-    - calendar_links: populated in commit 1/3
-    - email_sent / email_skipped_reason: commit 3/3
+    Notification fields are best-effort: a Resend outage or missing user
+    email never rolls back the booking. The cart is already CONFIRMED on
+    disk before any notification is attempted.
     """
 
     cart: Cart
     calendar_links: list[CalendarLink] = Field(
         default_factory=list,
         description="One Google Calendar add-event link per unique event in the cart",
+    )
+    email_sent: bool = Field(
+        False,
+        description="True if a confirmation email was successfully delivered to Resend",
+    )
+    email_skipped_reason: str | None = Field(
+        None,
+        description=(
+            "Why the confirmation email did not send (or None if it did). "
+            "Common values: 'resend_not_configured', 'no_email_in_preferences', "
+            "'resend_api_error', 'network_error'. Never includes the email address."
+        ),
     )
 
 

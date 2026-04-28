@@ -29,7 +29,9 @@ from events_mcp.models.cart import (
     CartState,
     PaymentQuote,
 )
+from events_mcp.models.events import EventDetail
 from events_mcp.notifications.calendar import build_google_calendar_url
+from events_mcp.notifications.email import send_booking_confirmation
 from events_mcp.storage.db import DEFAULT_USER_ID, carts_table
 from events_mcp.tools.discovery import get_event_details
 
@@ -366,14 +368,16 @@ async def confirm_booking() -> BookingConfirmation:
     PNG (as a data: URI) encoding the booking reference for venue
     entry. Clears expires_at since the seat hold no longer applies.
 
-    Returns a BookingConfirmation wrapping the saved cart and any
-    side-effect outputs — currently a list of Google Calendar deep
-    links (one per unique event in the cart) so the user can add the
-    event(s) to their own calendar with one click.
+    Returns a BookingConfirmation wrapping the saved cart plus three
+    side-effect outputs:
+    - Google Calendar deep links (one per unique event)
+    - email_sent / email_skipped_reason — Resend-backed confirmation email
+    - The .ics calendar file is included as the email's attachment, not
+      surfaced separately.
 
-    Side-effect failures (e.g. calendar lookup) do NOT roll back the
-    booking — the cart stays CONFIRMED and the relevant link is just
-    omitted with a logged reason.
+    Side-effect failures do NOT roll back the booking — the cart is
+    saved as CONFIRMED on disk before notifications are attempted.
+    Each side effect returns its own skip reason if it cannot complete.
 
     Once confirmed, the cart is no longer "open" — a subsequent
     create_cart will start a fresh one.
@@ -411,18 +415,62 @@ async def confirm_booking() -> BookingConfirmation:
         items_count=len(cart.items),
     )
 
-    calendar_links = await _build_calendar_links(cart, booking_id)
-    return BookingConfirmation(cart=cart, calendar_links=calendar_links)
+    # Fetch event details once; both side effects consume the same dict.
+    event_details_by_id = await _fetch_unique_event_details(cart)
+    calendar_links = _build_calendar_links(cart, booking_id, event_details_by_id)
+    email_sent, email_skipped_reason = await send_booking_confirmation(
+        cart=cart,
+        booking_id=booking_id,
+        event_details_by_id=event_details_by_id,
+        calendar_links=calendar_links,
+    )
+
+    return BookingConfirmation(
+        cart=cart,
+        calendar_links=calendar_links,
+        email_sent=email_sent,
+        email_skipped_reason=email_skipped_reason,
+    )
 
 
-async def _build_calendar_links(
-    cart: Cart, booking_id: str
+async def _fetch_unique_event_details(
+    cart: Cart,
+) -> dict[str, EventDetail]:
+    """Fetch event details for each unique event_id in the cart.
+
+    Lookups that fail (e.g. event was unlisted between add-to-cart and
+    confirm) are skipped with a log; the booking is already saved so we
+    never raise. The 900s detail cache makes repeat calls effectively
+    free, so callers may safely re-query the same event_ids.
+    """
+    details: dict[str, EventDetail] = {}
+    seen: set[str] = set()
+    for item in cart.items:
+        if item.event_id in seen:
+            continue
+        seen.add(item.event_id)
+        try:
+            details[item.event_id] = await get_event_details(item.event_id)
+        except TicketmasterAPIError:
+            log.warning(
+                "event_detail_lookup_failed",
+                user_id=DEFAULT_USER_ID,
+                event_id=item.event_id,
+            )
+    return details
+
+
+def _build_calendar_links(
+    cart: Cart,
+    booking_id: str,
+    event_details_by_id: dict[str, EventDetail],
 ) -> list[CalendarLink]:
     """Build one Google Calendar deep link per unique event in the cart.
 
-    Skips events whose details we can't fetch (logged) or that have no
-    start_date (logged). Never raises — notification failures must not
-    roll back a saved booking.
+    Skips events whose details we couldn't fetch or that have no
+    start_date (each logged). Pure function — does no I/O, so it
+    can't introduce its own failure modes beyond what the caller
+    already handled.
     """
     links: list[CalendarLink] = []
     seen: set[str] = set()
@@ -431,14 +479,8 @@ async def _build_calendar_links(
             continue
         seen.add(item.event_id)
 
-        try:
-            detail = await get_event_details(item.event_id)
-        except TicketmasterAPIError:
-            log.warning(
-                "calendar_link_lookup_failed",
-                user_id=DEFAULT_USER_ID,
-                event_id=item.event_id,
-            )
+        detail = event_details_by_id.get(item.event_id)
+        if detail is None:
             continue
 
         location_parts = [p for p in (detail.venue_name, detail.city) if p]
