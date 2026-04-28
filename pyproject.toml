@@ -8,6 +8,7 @@ dependencies = [
     "aiolimiter>=1.2.1",
     "cachetools>=7.0.6",
     "httpx>=0.28.1",
+    "ics>=0.7.3",
     "mcp[cli]>=1.27.0",
     "python-dotenv>=1.2.2",
     "qrcode[pil]>=8.2",
