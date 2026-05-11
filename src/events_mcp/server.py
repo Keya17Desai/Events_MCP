@@ -3,6 +3,8 @@ from typing import Annotated
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from events_mcp.logging import configure_logging, get_logger
 from events_mcp.prompts.discovery import (
@@ -43,6 +45,16 @@ mcp = FastMCP(
     host=os.getenv("HOST", "127.0.0.1"),
     port=int(os.getenv("PORT", "8000")),
 )
+
+
+@mcp.custom_route("/", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
+    return JSONResponse({
+        "status": "ok",
+        "server": "Events MCP",
+        "mcp_endpoint": "/mcp",
+        "tools": 16,
+    })
 
 
 @mcp.tool()
