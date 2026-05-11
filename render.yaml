@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: events-mcp
+    runtime: python
+    buildCommand: pip install uv && uv sync --frozen
+    startCommand: uv run events-mcp
+    envVars:
+      - key: MCP_TRANSPORT
+        value: streamable-http
+      - key: HOST
+        value: "0.0.0.0"
+      - key: TICKETMASTER_API_KEY
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM
+        value: "Events MCP <onboarding@resend.dev>"

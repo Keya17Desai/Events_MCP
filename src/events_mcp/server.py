@@ -1,3 +1,4 @@
+import os
 from typing import Annotated
 
 from mcp.server.fastmcp import FastMCP
@@ -39,6 +40,8 @@ mcp = FastMCP(
         "A server for discovering live events (concerts, sports, theater, festivals). "
         "Use search_events to find events by city, keyword, category, or date."
     ),
+    host=os.getenv("HOST", "127.0.0.1"),
+    port=int(os.getenv("PORT", "8000")),
 )
 
 
@@ -88,8 +91,16 @@ mcp.prompt()(surprise_me)
 def main() -> None:
     configure_logging()
     log = get_logger(__name__)
-    log.info("server_starting", transport="stdio")
-    mcp.run()
+
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    port = int(os.getenv("PORT", "8000"))
+
+    log.info("server_starting", transport=transport, port=port)
+
+    if transport == "streamable-http":
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":
