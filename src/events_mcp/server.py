@@ -39,8 +39,22 @@ from events_mcp.tools.favorites import (
 mcp = FastMCP(
     "Events MCP",
     instructions=(
-        "A server for discovering live events (concerts, sports, theater, festivals). "
-        "Use search_events to find events by city, keyword, category, or date."
+        "You are connected to Events MCP — a server for discovering and booking live events "
+        "(concerts, sports, theater, festivals) via the Ticketmaster API.\n\n"
+        "DISCOVERY: Use search_events to find events by city, keyword, category, or date. "
+        "Use get_event_details for full info on a specific event. "
+        "Use search_venues or search_attractions to resolve a venue or artist name.\n\n"
+        "FAVORITES & PREFERENCES: Users can save events (save_favorite), list them "
+        "(list_favorites), set their preferred city/genres/email (set_preferences), "
+        "and get personalised recommendations (get_recommendations).\n\n"
+        "BOOKING (simulated): Full cart flow — create_cart → add_to_cart → reserve_seats "
+        "→ generate_payment_link → confirm_booking. No real payment is taken. "
+        "confirm_booking sends a real email confirmation (if email is set in preferences) "
+        "and returns a Google Calendar deep link.\n\n"
+        "PROMPTS: Slash commands /event_night_plan, /genre_picks, /compare_events, "
+        "and /surprise_me are available for common multi-step tasks.\n\n"
+        "Always show prices and fees transparently. Never claim seats are limited unless "
+        "the API data says so. Never auto-confirm a booking without the user's explicit approval."
     ),
     host=os.getenv("HOST", "127.0.0.1"),
     port=int(os.getenv("PORT", "8000")),

@@ -1255,6 +1255,54 @@ Any MCP-compatible client can now connect by pointing at this URL.
 
 ---
 
+## Phase 7 — Polish & Ship ✅
+
+### Why tool descriptions matter more than you think
+
+The LLM (Claude) never reads your source code — it only sees the **tool name**, **docstring**, and **Field descriptions** that FastMCP serialises into the tool schema at startup. This is literally all it has to decide which tool to call and how to fill the parameters.
+
+Good descriptions answer three questions for the LLM:
+1. **When do I call this?** — what user intent triggers it
+2. **What do I get back?** — what fields are in the response
+3. **What are the gotchas?** — ordering requirements, idempotency, edge cases
+
+Bad description: `"""List all favorites."""`
+Good description: `"""List all events the user has saved as favorites, with event name, date, venue, and price."""`
+
+The second one tells the LLM what it will get back, so it can decide whether it needs to call this tool or another one.
+
+---
+
+### FastMCP `instructions` — the server-level system prompt
+
+The `instructions` argument to `FastMCP(...)` is sent to the LLM as server-level context before any tool is called. Think of it as a mini system prompt for your server. It should cover:
+
+- **What the server does** (one sentence)
+- **Tool groups and when to use each** (discovery, favorites, booking)
+- **The flow for multi-step tasks** (e.g. the booking state machine sequence)
+- **Ethical guardrails** (never claim false scarcity, never auto-confirm)
+
+Keep it factual and imperative — the LLM reads this once and uses it to orient all subsequent tool decisions.
+
+---
+
+### `custom_route` — adding non-MCP HTTP endpoints
+
+FastMCP exposes a `@mcp.custom_route(path, methods=[...])` decorator that adds a plain Starlette route alongside the MCP endpoint. Useful for health checks:
+
+```python
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+@mcp.custom_route("/", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "mcp_endpoint": "/mcp"})
+```
+
+This is how `GET https://events-mcp.onrender.com/` returns a JSON response instead of a 404.
+
+---
+
 ## Key Commands Reference
 
 ```bash

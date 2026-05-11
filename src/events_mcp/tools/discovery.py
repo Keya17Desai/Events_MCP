@@ -121,11 +121,11 @@ async def search_events(
         ),
     ] = None,
 ) -> SearchEventsResult:
-    """Search live events on Ticketmaster.
+    """Search live events on Ticketmaster. Returns name, date, venue, city, price range, and URL for each event.
 
-    All filters are optional but at least one (city, country_code, keyword,
-    or classification) is strongly recommended — unfiltered searches return
-    arbitrary global results.
+    At least one filter (city, country_code, keyword, or classification) is strongly recommended —
+    unfiltered searches return arbitrary global results. Use get_event_details for full info
+    on a specific event after finding its id here.
     """
     api_params: dict[str, Any] = {"size": size, "page": page}
     if keyword:

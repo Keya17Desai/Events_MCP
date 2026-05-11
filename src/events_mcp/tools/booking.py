@@ -136,7 +136,7 @@ def create_cart() -> Cart:
 
 
 def get_cart() -> Cart:
-    """Return the user's currently open cart.
+    """Return the user's currently open cart — items, quantities, prices, state, and expiry.
 
     Raises if no open cart exists — call create_cart first.
     """

@@ -86,7 +86,7 @@ async def save_favorite(
 
 
 def list_favorites() -> ListFavoritesResult:
-    """List all events the user has saved as favorites."""
+    """List all events the user has saved as favorites, with event name, date, venue, and price."""
     table = favorites_table()
     Fav = Query()
     rows = table.search(Fav.user_id == DEFAULT_USER_ID)
@@ -204,7 +204,7 @@ def set_preferences(
 
 
 def get_preferences() -> Preferences:
-    """Return the current user's preferences. Empty (all None) if never set."""
+    """Return the current user's preferences (city, genres, currency, email). All fields are None if never set via set_preferences."""
     table = preferences_table()
     Pref = Query()
     rows = table.search(Pref.user_id == DEFAULT_USER_ID)
