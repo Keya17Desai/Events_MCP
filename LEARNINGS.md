@@ -1159,13 +1159,99 @@ All side-effect log lines reference `user_id` and `cart_id` so they can be trace
 
 ---
 
-## Phase 6 — HTTP Transport & Deployment (upcoming)
+## Phase 6 — HTTP Transport & Deployment ✅
 
-| Concept | What it is |
-|---|---|
-| Streamable HTTP transport | MCP over HTTP instead of stdio. Client sends POST requests; server can stream responses via Server-Sent Events (SSE). |
-| SSE (Server-Sent Events) | A protocol for the server to push multiple messages to the client over a single HTTP connection. Used for streaming tool results. |
-| Deployment (Render/Railway) | Hosting the server on a public URL so anyone can use it, not just local Claude Desktop. |
+### stdio vs. Streamable HTTP
+
+**stdio** (what we used up to Phase 5.5) works by spawning the server as a child process and piping messages through stdin/stdout. Fast and zero-config locally, but can't be reached over the network.
+
+**Streamable HTTP** makes the server a real HTTP service:
+- `POST /mcp` — client sends a JSON-RPC message, server responds (standard request/response)
+- `GET /mcp` — client opens an **SSE stream** for server-initiated messages (progress, notifications)
+
+FastMCP handles both routes automatically when you call `mcp.run(transport="streamable-http")`.
+
+---
+
+### SSE (Server-Sent Events)
+
+SSE is a simple HTTP-based protocol where the server keeps a connection open and pushes events as they happen. The client sends one `GET` with `Accept: text/event-stream`, and the server streams lines back in the format `data: ...\n\n`. It's one-directional (server → client only), which is all MCP needs for streaming.
+
+This is why a plain `curl https://events-mcp.onrender.com/mcp` returns `406 Not Acceptable` — the server requires `Accept: text/event-stream` on GET requests.
+
+---
+
+### FastMCP `host` and `port`
+
+These are **constructor parameters** on `FastMCP(...)`, not arguments to `mcp.run()`. They must be set before `run()` is called:
+
+```python
+mcp = FastMCP(
+    "Events MCP",
+    host=os.getenv("HOST", "127.0.0.1"),  # 0.0.0.0 in production
+    port=int(os.getenv("PORT", "8000")),
+)
+```
+
+Render injects `PORT` automatically. We add `HOST=0.0.0.0` manually so the server binds to all network interfaces (required for Render to detect the open port).
+
+---
+
+### Transport switching pattern
+
+We use one env var to control transport mode so the same codebase works locally (stdio) and in production (HTTP):
+
+```python
+transport = os.getenv("MCP_TRANSPORT", "stdio")
+
+if transport == "streamable-http":
+    mcp.run(transport="streamable-http")
+else:
+    mcp.run()  # defaults to stdio
+```
+
+Local dev: no env var needed, stdio is the default.  
+Render: `MCP_TRANSPORT=streamable-http` set in the dashboard.
+
+---
+
+### render.yaml — Infrastructure as Code
+
+`render.yaml` in the repo root tells Render how to build and run the service:
+
+```yaml
+services:
+  - type: web
+    name: events-mcp
+    runtime: python
+    buildCommand: pip install uv && uv sync --frozen
+    startCommand: uv run events-mcp
+    envVars:
+      - key: MCP_TRANSPORT
+        value: streamable-http
+      - key: HOST
+        value: "0.0.0.0"
+      - key: TICKETMASTER_API_KEY
+        sync: false   # "fill this in the dashboard" — not stored in the file
+```
+
+`sync: false` means Render won't try to read the value from the file — it prompts you to set it manually in the dashboard. Use this for secrets.
+
+---
+
+### Ephemeral storage on Render free tier
+
+Render's free tier does **not** persist the filesystem across deploys. Our TinyDB file (favorites, bookings) is wiped on each redeploy. Acceptable for a learning project. The fix for production would be to swap TinyDB for Render's free PostgreSQL add-on.
+
+---
+
+### Live URL
+
+```
+https://events-mcp.onrender.com/mcp
+```
+
+Any MCP-compatible client can now connect by pointing at this URL.
 
 ---
 
